@@ -32,22 +32,22 @@ class WifiDirectBroadcastReceiver(
                 }
             }
             WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
-                Log.d("WifiDirectReceiver", "P2P peers changed")
-                // Request available peers from the wifi p2p manager.
-                // This is an asynchronous call and the calling activity/fragment
-                // is notified with a callback on PeerListListener.onPeersAvailable()
-                if (ActivityCompat.checkSelfPermission(
-                        context,
-                        Manifest.permission.ACCESS_FINE_LOCATION // Or appropriate nearby devices perm for API 31+
-                    ) == PackageManager.PERMISSION_GRANTED // Ensure permission is still granted
-                ) {
-                    manager?.requestPeers(channel) { peers ->
-                        Log.d("WifiDirectReceiver", "Peers available: ${peers.deviceList.size}")
-                        viewModel.onPeersAvailable(peers.deviceList)
+                Log.d("WifiDirectReceiver", "WIFI_P2P_PEERS_CHANGED_ACTION received.")
+                // ACCESS_FINE_LOCATION is generally required to get the peer list.
+                if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                    Log.d("WifiDirectReceiver", "ACCESS_FINE_LOCATION for requestPeers is GRANTED.")
+                    manager?.requestPeers(channel) { peers -> // This is WifiP2pManager.PeerListListener
+                        Log.i("WifiDirectReceiver", "PeerListListener.onPeersAvailable | System peer list size: ${peers?.deviceList?.size ?: "null"}")
+                        if (peers != null) {
+                            viewModel.onPeersAvailable(peers.deviceList ?: emptyList())
+                        } else {
+                            Log.w("WifiDirectReceiver", "PeerListListener.onPeersAvailable received NULL peers object.")
+                            viewModel.onPeersAvailable(emptyList())
+                        }
                     }
                 } else {
-                    Log.w("WifiDirectReceiver", "Location permission not granted for requesting peers.")
-                    // Handle missing permission case, maybe notify user
+                    Log.e("WifiDirectReceiver", "ACCESS_FINE_LOCATION permission NOT granted when WIFI_P2P_PEERS_CHANGED_ACTION received. Cannot request peers.")
+                    viewModel.onPeersAvailable(emptyList()) // Inform ViewModel no peers can be fetched
                 }
             }
             WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
@@ -55,9 +55,21 @@ class WifiDirectBroadcastReceiver(
                 Log.d("WifiDirectReceiver", "P2P connection changed")
             }
             WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION -> {
-                // This device's details have changed.
-                Log.d("WifiDirectReceiver", "This device details changed")
+                val thisDevice = intent.getParcelableExtra<WifiP2pDevice>(WifiP2pManager.EXTRA_WIFI_P2P_DEVICE)
+                Log.d("WifiDirectReceiver", "WIFI_P2P_THIS_DEVICE_CHANGED_ACTION - This device: ${thisDevice?.deviceName}, Status: ${getDeviceStatus(thisDevice?.status ?: -1)}")
+                // You could update a LiveData/StateFlow in ViewModel with thisDevice object
             }
+        }
+    }
+
+    fun getDeviceStatus(deviceStatus: Int): String {
+        return when (deviceStatus) {
+            WifiP2pDevice.AVAILABLE -> "Available"
+            WifiP2pDevice.INVITED -> "Invited"
+            WifiP2pDevice.CONNECTED -> "Connected"
+            WifiP2pDevice.FAILED -> "Failed"
+            WifiP2pDevice.UNAVAILABLE -> "Unavailable"
+            else -> "Unknown ($deviceStatus)"
         }
     }
 }
