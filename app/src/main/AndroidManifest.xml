@@ -15,6 +15,10 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 <!--     Bluetooth Permissions (add if you plan to use Bluetooth) -->
+    <!-- For Bluetooth discovery and connection -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+
 <!--     Required for Android 12 (API 31) and above -->
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
@@ -22,7 +26,8 @@
     <!-- For older Android versions (below API 31) -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
-
+    <!-- ACCESS_FINE_LOCATION is often needed for Bluetooth scanning on older versions or for full results  -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
 
     <!-- Storage Permissions -->
     <!-- For Android 9 (API 28) and below. For newer versions, use SAF or MANAGE_EXTERNAL_STORAGE -->

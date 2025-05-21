@@ -3,7 +3,9 @@ package com.example.syncshare.utils
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.ManagedActivityResultLauncher
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -77,5 +79,44 @@ fun getOldStoragePermissions(): Array<String> {
         )
     } else {
         arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE) // READ might still be useful
+    }
+}
+
+fun isLocationEnabled(context: Context): Boolean {
+    val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+    return if (locationManager == null) {
+        false // Should not happen on a normal device
+    } else {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            locationManager.isLocationEnabled
+        } else {
+            try {
+                // For older versions, check specific providers or Settings.Secure
+                @Suppress("DEPRECATION")
+                val mode = Settings.Secure.getInt(context.contentResolver, Settings.Secure.LOCATION_MODE)
+                mode != Settings.Secure.LOCATION_MODE_OFF
+            } catch (e: Settings.SettingNotFoundException) {
+                // Fallback if setting not found, check providers
+                locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
+                        locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+            }
+        }
+    }
+}
+
+fun getBluetoothPermissions(): Array<String> {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) { // API 31+
+        arrayOf(
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_CONNECT,
+            Manifest.permission.BLUETOOTH_ADVERTISE
+            // Optionally add Manifest.permission.ACCESS_FINE_LOCATION if needed for more robust scanning
+        )
+    } else {
+        arrayOf(
+            Manifest.permission.BLUETOOTH,
+            Manifest.permission.BLUETOOTH_ADMIN,
+            Manifest.permission.ACCESS_FINE_LOCATION // Often required for discovery on older versions
+        )
     }
 }
