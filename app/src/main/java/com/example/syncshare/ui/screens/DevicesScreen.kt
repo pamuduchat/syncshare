@@ -8,6 +8,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -21,8 +23,6 @@ import com.example.syncshare.utils.getWifiDirectPermissions
 import com.example.syncshare.utils.hasPermission
 import com.example.syncshare.utils.rememberPermissionsLauncher
 import com.example.syncshare.viewmodels.DevicesViewModel
-import com.google.accompanist.swiperefresh.SwipeRefresh
-import com.google.accompanist.swiperefresh.rememberSwipeRefreshState
 
 @Composable
 fun DevicesScreen(
@@ -30,11 +30,11 @@ fun DevicesScreen(
     viewModel: DevicesViewModel = viewModel()
 ) {
     val context = LocalContext.current
-    // Corrected: Directly use the SnapshotStateList from the ViewModel
+    // Directly use the SnapshotStateList from the ViewModel
     val discoveredPeers: List<WifiP2pDevice> = viewModel.discoveredPeers
     val permissionStatus by remember { viewModel.permissionRequestStatus }
     val isRefreshing by viewModel.isRefreshing.collectAsState()
-    val lifecycleOwner = LocalLifecycleOwner.current
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
 
 
     // Permission Launcher
@@ -45,20 +45,28 @@ fun DevicesScreen(
             viewModel.permissionRequestStatus.value = "Permission $perm ${if (granted) "Granted" else "Denied"}"
         }
         if (allGranted) {
-            viewModel.registerReceiver()
-            viewModel.startDiscovery()
+            try {
+                viewModel.registerReceiver()
+                viewModel.startDiscovery()
+            } catch (e: SecurityException) {
+                viewModel.permissionRequestStatus.value = "Security exception: ${e.message}"
+            }
         } else {
             viewModel.permissionRequestStatus.value = "Required permissions denied. Cannot discover devices."
         }
     }
 
     // Handle lifecycle for registering/unregistering broadcast receiver
-    DisposableEffect(lifecycleOwner) { // Observe lifecycleOwner
+    DisposableEffect(lifecycleOwner) {
         val lifecycleObserver = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_RESUME -> {
                     if (getWifiDirectPermissions().all { context.hasPermission(it) }) {
-                        viewModel.registerReceiver()
+                        try {
+                            viewModel.registerReceiver()
+                        } catch (e: SecurityException) {
+                            viewModel.permissionRequestStatus.value = "Security exception: ${e.message}"
+                        }
                     }
                 }
                 Lifecycle.Event.ON_PAUSE -> {
@@ -71,10 +79,8 @@ fun DevicesScreen(
 
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(lifecycleObserver)
-            // viewModel.unregisterReceiver() // ViewModel handles unregister in onCleared or on ON_PAUSE
         }
     }
-
 
     Column(
         modifier = modifier
@@ -85,8 +91,11 @@ fun DevicesScreen(
         Button(onClick = {
             val permsToRequest = getWifiDirectPermissions()
             if (permsToRequest.all { context.hasPermission(it) }) {
-                // viewModel.registerReceiver() // Already handled by lifecycle/permission grant
-                viewModel.startDiscovery()
+                try {
+                    viewModel.startDiscovery()
+                } catch (e: SecurityException) {
+                    viewModel.permissionRequestStatus.value = "Security exception: ${e.message}"
+                }
             } else {
                 permissionsLauncher.launch(permsToRequest)
             }
@@ -97,27 +106,60 @@ fun DevicesScreen(
         Text(permissionStatus, style = MaterialTheme.typography.bodySmall)
         Spacer(modifier = Modifier.height(16.dp))
 
-        if (discoveredPeers.isEmpty() && !isRefreshing) {
-            Text("No devices found. Tap 'Search' to discover nearby devices running SyncShare.")
-        }
+        // Use SwipeRefreshLayout alternative
+        val coroutineScope = rememberCoroutineScope()
 
-        SwipeRefresh(
-            state = rememberSwipeRefreshState(isRefreshing),
-            onRefresh = {
-                val permsToRequest = getWifiDirectPermissions()
-                if (permsToRequest.all { context.hasPermission(it) }) {
-                    // viewModel.registerReceiver() // Already handled
-                    viewModel.startDiscovery()
-                } else {
-                    permissionsLauncher.launch(permsToRequest)
-                }
-            }
+        Box(
+            modifier = Modifier.fillMaxSize()
         ) {
-            LazyColumn(modifier = Modifier.fillMaxSize()) {
-                // Ensure 'device' is correctly typed as WifiP2pDevice here
-                items(items = discoveredPeers, key = { device: WifiP2pDevice -> device.deviceAddress ?: device.hashCode() }) { device ->
+            if (discoveredPeers.isEmpty() && !isRefreshing) {
+                Text(
+                    "No devices found. Tap 'Search' to discover nearby devices running SyncShare.",
+                    modifier = Modifier.align(Alignment.Center)
+                )
+            }
+
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(vertical = 8.dp)
+            ) {
+                if (isRefreshing) {
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp),
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(24.dp),
+                                strokeWidth = 2.dp
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Refreshing...")
+                        }
+                    }
+                }
+
+                items(
+                    items = discoveredPeers,
+                    key = { device: WifiP2pDevice -> device.deviceAddress ?: device.hashCode().toString() }
+                ) { device ->
                     DeviceItem(device = device, onClick = {
                         viewModel.permissionRequestStatus.value = "Clicked on ${device.deviceName}"
+                        // Add connection logic here
+                        try {
+                            // Instead of directly using connectToDevice, add your connection logic here
+                            coroutineScope.launch {
+                                // Example implementation - replace with your actual connection logic
+                                viewModel.permissionRequestStatus.value = "Connecting to ${device.deviceName}..."
+                                // viewModel.connectToDevice(device)
+                            }
+                        } catch (e: SecurityException) {
+                            viewModel.permissionRequestStatus.value = "Permission denied: ${e.message}"
+                        } catch (e: Exception) {
+                            viewModel.permissionRequestStatus.value = "Connection error: ${e.message}"
+                        }
                     })
                     Divider()
                 }
@@ -127,7 +169,7 @@ fun DevicesScreen(
 }
 
 @Composable
-fun DeviceItem(device: WifiP2pDevice, onClick: () -> Unit) { // device type is WifiP2pDevice
+fun DeviceItem(device: WifiP2pDevice, onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -136,13 +178,15 @@ fun DeviceItem(device: WifiP2pDevice, onClick: () -> Unit) { // device type is W
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(modifier = Modifier.weight(1f)) {
-            Text(device.deviceName ?: "Unknown Device", style = MaterialTheme.typography.titleMedium)
+            Text(
+                text = device.deviceName.takeIf { !it.isNullOrBlank() } ?: "Unknown Device",
+                style = MaterialTheme.typography.titleMedium
+            )
             Text(
                 "Status: ${getDeviceStatus(device.status)}",
                 style = MaterialTheme.typography.bodySmall
             )
             Text(
-                // deviceAddress can be null if the device is not yet configured (e.g., group owner not decided)
                 "Address: ${device.deviceAddress ?: "N/A"}",
                 style = MaterialTheme.typography.bodySmall
             )
@@ -150,7 +194,7 @@ fun DeviceItem(device: WifiP2pDevice, onClick: () -> Unit) { // device type is W
     }
 }
 
-// getDeviceStatus function remains the same
+// Device status helper function
 fun getDeviceStatus(deviceStatus: Int): String {
     return when (deviceStatus) {
         WifiP2pDevice.AVAILABLE -> "Available"
