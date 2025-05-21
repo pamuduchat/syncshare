@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.os.Build
 import android.provider.Settings
+import android.util.Log
 import androidx.activity.compose.ManagedActivityResultLauncher
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -81,25 +82,34 @@ fun getOldStoragePermissions(): Array<String> {
         arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE) // READ might still be useful
     }
 }
-
 fun isLocationEnabled(context: Context): Boolean {
     val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
-    return if (locationManager == null) {
-        false // Should not happen on a normal device
-    } else {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            locationManager.isLocationEnabled
-        } else {
+    if (locationManager == null) {
+        Log.w("PermissionUtils", "LocationManager service not available.")
+        return false
+    }
+
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) { // API 28+
+        locationManager.isLocationEnabled
+    } else { // Below API 28
+        try {
+            @Suppress("DEPRECATION")
+            val locationMode = Settings.Secure.getInt(context.contentResolver, Settings.Secure.LOCATION_MODE)
+            locationMode != Settings.Secure.LOCATION_MODE_OFF
+        } catch (e: Settings.SettingNotFoundException) {
+            Log.w("PermissionUtils", "LOCATION_MODE setting not found, checking providers.", e)
+            // Fallback to checking providers if LOCATION_MODE setting is not found
             try {
-                // For older versions, check specific providers or Settings.Secure
-                @Suppress("DEPRECATION")
-                val mode = Settings.Secure.getInt(context.contentResolver, Settings.Secure.LOCATION_MODE)
-                mode != Settings.Secure.LOCATION_MODE_OFF
-            } catch (e: Settings.SettingNotFoundException) {
-                // Fallback if setting not found, check providers
-                locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
-                        locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+                val gpsEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+                val networkEnabled = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+                gpsEnabled || networkEnabled
+            } catch (ex: Exception) {
+                Log.e("PermissionUtils", "Exception checking location providers", ex)
+                false
             }
+        } catch (e: Exception) { // Catch any other unexpected errors
+            Log.e("PermissionUtils", "Unexpected error checking location mode", e)
+            false
         }
     }
 }

@@ -119,6 +119,20 @@ fun DevicesScreen(
                         viewModel.refreshP2pGroupInfoOnResume()
                     } else { Log.w("DevicesScreen", "ON_RESUME: Fine Location MISSING for P2P group info.") }
                     viewModel.updateBluetoothState()
+                    if (viewModel.isBluetoothEnabled.value) {
+                        // Check Bluetooth permissions before starting server
+                        val btPerms = getBluetoothPermissions()
+                        if (btPerms.all { ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }) {
+                            Log.d("DevicesScreen", "ON_RESUME: Bluetooth permissions OK, preparing BT service.")
+                            viewModel.prepareBluetoothService() // This will start the BT server
+                        } else {
+                            Log.w("DevicesScreen", "ON_RESUME: Bluetooth permissions MISSING. BT Server not started.")
+                            // Optionally, you could trigger bluetoothPermissionsLauncher.launch(btPerms) here
+                            // if you want to proactively ask for permissions on resume.
+                        }
+                    } else {
+                        Log.d("DevicesScreen", "ON_RESUME: Bluetooth is not enabled.")
+                    }
                 }
                 Lifecycle.Event.ON_PAUSE -> {
                     Log.d("DevicesScreen", "ON_PAUSE triggered.")
@@ -164,6 +178,13 @@ fun DevicesScreen(
             }
             Spacer(modifier = Modifier.height(8.dp))
         }
+        val btConnectionStatus by viewModel.bluetoothConnectionStatus.collectAsState()
+        Text(
+            text = "BT Status: $btConnectionStatus",
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.fillMaxWidth()
+        )
+
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -272,12 +293,16 @@ fun DevicesScreen(
                                 }
                                 DeviceTechnology.BLUETOOTH_CLASSIC -> {
                                     val btDevice = device.originalDeviceObject as? BluetoothDevice
-                                    btDevice?.let { coroutineScope.launch { viewModel.connectToBluetoothDevice(it) } }
+                                    btDevice?.let {
+                                        Log.d("DevicesScreen", "Attempting BT connect to: ${it.name ?: it.address}")
+                                        viewModel.connectToBluetoothDevice(it)
+                                    }
                                 }
                                 DeviceTechnology.UNKNOWN -> {
                                     Log.w("DevicesScreen", "Clicked on device with UNKNOWN technology: ${device.name}")
                                     viewModel.permissionRequestStatus.value = "Cannot connect: Unknown device type."
                                 }
+
                                 // Add 'else -> {}' or handle any other DeviceTechnology types you add
                             }
                         } catch (e: SecurityException) {
