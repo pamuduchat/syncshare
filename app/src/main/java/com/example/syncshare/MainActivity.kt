@@ -1,6 +1,7 @@
 package com.example.syncshare
 
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -27,6 +28,7 @@ import com.example.syncshare.ui.theme.SyncshareTheme
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Log.d("SyncShareApp", "MainActivity onCreate CALLED")
         enableEdgeToEdge() // Manages system bars for edge-to-edge
         setContent {
             SyncshareTheme {
