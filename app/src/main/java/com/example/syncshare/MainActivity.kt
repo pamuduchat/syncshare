@@ -23,6 +23,9 @@ import com.example.syncshare.navigation.Screen
 import com.example.syncshare.navigation.bottomNavItems
 import com.example.syncshare.ui.screens.* // Import your screens
 import com.example.syncshare.ui.theme.SyncshareTheme
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.syncshare.viewmodels.DevicesViewModel
+import com.example.syncshare.viewmodels.ManageFoldersViewModel
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -39,6 +42,9 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainAppScreen() {
     val navController = rememberNavController()
+    // Provide shared ViewModels at the top level
+    val devicesViewModel: DevicesViewModel = viewModel()
+    val foldersViewModel: ManageFoldersViewModel = viewModel()
 
     Scaffold(
         bottomBar = {
@@ -76,10 +82,10 @@ fun MainAppScreen() {
             startDestination = Screen.ManageFolders.route, // Default screen
             modifier = Modifier.padding(innerPadding)
         ) {
-            composable(Screen.ManageFolders.route) { ManageFoldersScreen() }
-            composable(Screen.Devices.route) { DevicesScreen() }
-            composable(Screen.Sync.route) { SyncScreen() }
-            composable(Screen.History.route) { HistoryScreen() }
+            composable(Screen.ManageFolders.route) { ManageFoldersScreen(viewModel = foldersViewModel) }
+            composable(Screen.Devices.route) { DevicesScreen(viewModel = devicesViewModel) }
+            composable(Screen.Sync.route) { SyncScreen(devicesViewModel = devicesViewModel, foldersViewModel = foldersViewModel) }
+            composable(Screen.History.route) { HistoryScreen(devicesViewModel = devicesViewModel) }
             composable(Screen.Settings.route) { SettingsScreen() }
         }
     }
