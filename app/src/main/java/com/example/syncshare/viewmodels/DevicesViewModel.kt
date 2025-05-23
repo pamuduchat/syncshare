@@ -577,7 +577,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             // closeCommunicationStreams will handle closing the activeSocket if it's the BT one.
             if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
-                closeCommunicationStreams(CommunicationTechnology.BLUETOOTH)
+                closeCommunicationStreams()
             } else { // If P2P was active, BT socket might still need explicit closing if it was connected separately
                 try { connectedBluetoothSocket?.close() }
                 catch (e: IOException) { Log.e("DevicesViewModel", "Could not close connected Bluetooth socket during disconnectBluetooth: ${e.message}") }
@@ -801,24 +801,36 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
 
 
-    private fun setupCommunicationStreams(socket: BluetoothSocket) { // Adapt for WifiP2pSocket later
-        Log.d("DevicesViewModel", "Setting up communication streams for Bluetooth socket.")
+    private fun setupCommunicationStreams(socket: Any, technology: CommunicationTechnology) {
+        Log.d("DevicesViewModel", "Setting up communication streams for ${technology.name} socket.")
         try {
-            // IMPORTANT: Get OutputStream first, then InputStream, or vice-versa consistently on both ends.
-            // It can sometimes deadlock if done in opposite orders.
-            objectOutputStream = ObjectOutputStream(socket.outputStream)
-            objectOutputStream?.flush() // Flush to send header if any
-            objectInputStream = ObjectInputStream(socket.inputStream)
-            Log.i("DevicesViewModel", "Communication streams established.")
+            when (technology) {
+                CommunicationTechnology.BLUETOOTH -> {
+                    val btSocket = socket as BluetoothSocket
+                    objectOutputStream = ObjectOutputStream(btSocket.outputStream)
+                    objectInputStream = ObjectInputStream(btSocket.inputStream)
+                }
+                CommunicationTechnology.P2P -> {
+                    val p2pSocket = socket as java.net.Socket
+                    objectOutputStream = ObjectOutputStream(p2pSocket.getOutputStream())
+                    objectInputStream = ObjectInputStream(p2pSocket.getInputStream())
+                }
+            }
+            objectOutputStream?.flush()
+            Log.i("DevicesViewModel", "Communication streams established for ${technology.name}.")
             permissionRequestStatus.value = "Streams open. Ready to sync."
 
             // Start listening for incoming messages in a separate coroutine
             startListeningForMessages()
 
         } catch (e: IOException) {
-            Log.e("DevicesViewModel", "Error setting up communication streams: ${e.message}", e)
+            Log.e("DevicesViewModel", "Error setting up communication streams for ${technology.name}: ", e)
             permissionRequestStatus.value = "Error: Stream setup failed."
-            disconnectBluetooth() // Or a generic disconnect
+            if (technology == CommunicationTechnology.BLUETOOTH) {
+                disconnectBluetooth()
+            } else {
+                disconnectP2p()
+            }
         }
     }
 
@@ -942,7 +954,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         // For this step, I will proceed with the assumption that setupCommunicationStreams can handle a BluetoothSocket
         // by perhaps wrapping it or using its streams. The immediate goal is to call it.
         // This might be a point of failure if not correctly implemented in setupCommunicationStreams.
-        setupCommunicationStreams(connectedBluetoothSocket!!, CommunicationTechnology.BLUETOOTH)
+        setupCommunicationStreams(socket, CommunicationTechnology.BLUETOOTH)
 
 
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.Main) { // Update UI for accepted connection
@@ -1024,7 +1036,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                                 _p2pConnectionStatus.value = "P2P Client Connected: $remoteAddress"
                                 permissionRequestStatus.value = "P2P Client Connected: $remoteAddress"
                             }
-                            setupCommunicationStreams(client, CommunicationTechnology.P2P)
+                            setupCommunicationStreams(p2pClientSocket!!, CommunicationTechnology.P2P)
                         } else {
                             if (!isActive) break 
                             Log.w("DevicesViewModel", "P2P server accept() returned null without exception.")
@@ -1111,7 +1123,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             p2pServerJob = null
 
             if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
-                closeCommunicationStreams(CommunicationTechnology.P2P) 
+                closeCommunicationStreams() 
             }
             // Ensure P2P sockets are closed regardless of current tech, as they might be open from a previous attempt
             closeP2pSockets()
