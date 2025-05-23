@@ -57,6 +57,7 @@ import java.io.ObjectOutputStream
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID 
+import android.webkit.MimeTypeMap
 
 enum class CommunicationTechnology { BLUETOOTH, P2P }
 
@@ -115,6 +116,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     private val _syncHistory = mutableStateListOf<SyncHistoryEntry>()
     val syncHistory: List<SyncHistoryEntry> = _syncHistory
 
+    // --- Pending Folder Mapping for Incoming Syncs ---
+    val pendingFolderMapping = mutableStateOf<String?>(null)
+    var pendingSyncMessage: SyncMessage? = null
 
     private val wifiDirectPeersInternal = mutableStateListOf<WifiP2pDevice>()
     private val bluetoothDevicesInternal = mutableStateListOf<BluetoothDevice>()
@@ -124,6 +128,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     private var objectInputStream: ObjectInputStream? = null
     private var communicationJob: Job? = null
     private var currentCommunicationTechnology: CommunicationTechnology? = null
+
+    private val outputStreamLock = Any()
 
     init {
         Log.d("DevicesViewModel", "DevicesViewModel - INIT BLOCK - START")
@@ -857,13 +863,12 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     Log.d("DevicesViewModel", "Received SYNC_REQUEST_METADATA for folder: ${message.folderName}")
                     permissionRequestStatus.value = "Received sync request for '${message.folderName}'"
                     _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "Unknown", status = "Initiated (Receiver)", details = "Received sync request for folder."))
-                    val folderNameToUriString = message.folderName
-                    val localFolderUri = try { Uri.parse(folderNameToUriString) } catch (e: Exception) { null }
+                    val folderName = message.folderName
+                    val localFolderUri = _activeSyncDestinationUris.value[folderName]
 
                     if (localFolderUri == null) {
-                        Log.e("DevicesViewModel", "Could not parse folderName to URI: ${message.folderName}")
-                        sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, errorMessage = "Invalid folder identifier on receiver: ${message.folderName}"))
-                        _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "Unknown", status = "Error", details = "Invalid folder identifier on receiver."))
+                        pendingFolderMapping.value = folderName
+                        pendingSyncMessage = message
                         return@launch
                     }
 
@@ -1169,7 +1174,10 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         fun traverse(currentDocumentFile: DocumentFile, currentRelativePath: String) {
             if (!currentDocumentFile.isDirectory) return
 
-            currentDocumentFile.listFiles().forEach { file ->
+            val children = currentDocumentFile.listFiles()
+            Log.d("DevicesViewModel", "Traversing: ${currentDocumentFile.uri}, found ${children.size} children")
+            for (file in children) {
+                Log.d("DevicesViewModel", "Child: ${file.name}, isFile=${file.isFile}, isDirectory=${file.isDirectory}, uri=${file.uri}")
                 if (file.isFile) {
                     val relativePath = if (currentRelativePath.isEmpty()) file.name ?: "" else "$currentRelativePath/${file.name}"
                     if (relativePath.isNotEmpty()) {
@@ -1185,7 +1193,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 } else if (file.isDirectory) {
                     val nextRelativePath = if (currentRelativePath.isEmpty()) file.name ?: "" else "$currentRelativePath/${file.name}"
                     if (nextRelativePath.isNotEmpty()) {
-                         traverse(file, nextRelativePath)
+                        traverse(file, nextRelativePath)
                     }
                 }
             }
@@ -1205,6 +1213,12 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         }
         val context = getApplication<Application>().applicationContext
         val folderNameForSyncMessage = DocumentFile.fromTreeUri(context, folderUri)?.name ?: folderUri.toString()
+
+        // --- Store the mapping from folder name to URI ---
+        val currentMap = _activeSyncDestinationUris.value.toMutableMap()
+        currentMap[folderNameForSyncMessage] = folderUri
+        _activeSyncDestinationUris.value = currentMap.toMap()
+        // -------------------------------------------------
 
         viewModelScope.launch {
             permissionRequestStatus.value = "Preparing to sync folder: $folderNameForSyncMessage"
@@ -1275,45 +1289,51 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         val buffer = ByteArray(bufferSize)
         var bytesRead: Int
         var totalBytesSent: Long = 0
+        var chunkCount = 0
 
-        try {
-            context.contentResolver.openInputStream(targetDocumentFile.uri).use { fis ->
-                if (fis == null) {
-                    Log.e("DevicesViewModel", "Failed to open InputStream for ${targetDocumentFile.uri}")
-                    sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = syncFolderName, errorMessage = "Failed to read file on sender: $relativePath"))
-                    _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Error", details = "Failed to read file on sender: $relativePath."))
-                    return
-                }
-                while (fis.read(buffer).also { bytesRead = it } != -1 && currentCoroutineContext().isActive) {
-                    val chunkToSend = if (bytesRead == bufferSize) buffer else buffer.copyOf(bytesRead)
-                    sendMessage(SyncMessage(MessageType.FILE_CHUNK, folderName = syncFolderName, fileChunkData = chunkToSend))
-                    totalBytesSent += bytesRead
-                    delay(5)
-                }
-            }
-
-            if (!currentCoroutineContext().isActive) {
-                Log.w("DevicesViewModel", "File sending for $relativePath was cancelled during/after read loop.")
-                _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Cancelled", details = "File sending for $relativePath was cancelled."))
+        Log.d("DevicesViewModel", "Sending file: $relativePath, size: ${targetDocumentFile.length()}")
+        context.contentResolver.openInputStream(targetDocumentFile.uri).use { fis ->
+            if (fis == null) {
+                Log.e("DevicesViewModel", "Failed to open InputStream for ${targetDocumentFile.uri}")
+                sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = syncFolderName, errorMessage = "Failed to read file on sender: $relativePath"))
+                _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Error", details = "Failed to read file on sender: $relativePath."))
                 return
             }
-            Log.i("DevicesViewModel", "Finished sending chunks for $relativePath from $syncFolderName, total $totalBytesSent bytes.")
+            while (fis.read(buffer).also { bytesRead = it } != -1 && currentCoroutineContext().isActive) {
+                if (bytesRead > 0) {
+                    try {
+                        val chunkToSend = buffer.copyOf(bytesRead)
+                        if (chunkToSend.size != bytesRead) {
+                            Log.w("DevicesViewModel", "Chunk size mismatch: chunkToSend.size=${chunkToSend.size}, bytesRead=$bytesRead")
+                        }
+                        Log.d("DevicesViewModel", "Preparing to send chunk $chunkCount: bytesRead=$bytesRead, chunkToSend.size=${chunkToSend.size}, first 8 bytes: ${chunkToSend.take(8).joinToString(" ") { String.format("%02x", it) }}, last 8 bytes: ${chunkToSend.takeLast(8).joinToString(" ") { String.format("%02x", it) }}")
+                        try {
+                            sendMessage(SyncMessage(MessageType.FILE_CHUNK, folderName = syncFolderName, fileChunkData = chunkToSend))
+                        } catch (e: Exception) {
+                            Log.e("DevicesViewModel", "Exception sending chunk $chunkCount: ${e.message}", e)
+                            throw e
+                        }
+                        totalBytesSent += bytesRead
+                        chunkCount++
+                        Log.d("DevicesViewModel", "Sent chunk $chunkCount of size $bytesRead for $relativePath (total sent: $totalBytesSent)")
+                    } catch (e: Exception) {
+                        Log.e("DevicesViewModel", "Exception preparing chunk $chunkCount: bytesRead=$bytesRead, buffer.size=${buffer.size}", e)
+                        throw e
+                    }
+                } else if (bytesRead < 0) {
+                    Log.w("DevicesViewModel", "Negative bytesRead ($bytesRead) at chunk $chunkCount. Not sending.")
+                }
+                delay(5)
+            }
+        }
+        Log.d("DevicesViewModel", "Finished sending $relativePath, total bytes sent: $totalBytesSent (expected: ${targetDocumentFile.length()})")
 
-        } catch (e: IOException) {
-            Log.e("DevicesViewModel", "IOException during file send for $relativePath from $syncFolderName: ${e.message}", e)
-            if (currentCoroutineContext().isActive) {
-                sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = syncFolderName, errorMessage = "Error sending file $relativePath: ${e.message}"))
-            }
-            _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName , status = "Error", details = "Failed to send file $relativePath: ${e.message}"))
-            return
-        } catch (e: Exception) {
-            Log.e("DevicesViewModel", "Unexpected exception during file send for $relativePath from $syncFolderName: ${e.message}", e)
-            if (currentCoroutineContext().isActive) {
-                sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = syncFolderName, errorMessage = "Unexpected error sending file $relativePath: ${e.message}"))
-            }
-            _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName , status = "Error", details = "Unexpected error sending file $relativePath: ${e.message}"))
+        if (!currentCoroutineContext().isActive) {
+            Log.w("DevicesViewModel", "File sending for $relativePath was cancelled during/after read loop.")
+            _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Cancelled", details = "File sending for $relativePath was cancelled."))
             return
         }
+        Log.i("DevicesViewModel", "Finished sending chunks for $relativePath from $syncFolderName, total $totalBytesSent bytes.")
 
         if (currentCoroutineContext().isActive) {
             sendMessage(SyncMessage(MessageType.FILE_TRANSFER_END, folderName = syncFolderName, fileTransferInfo = transferInfo))
@@ -1377,9 +1397,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
                 for (i in 0 until pathSegments.size - 1) {
                     val segment = pathSegments[i]
-                    var childDocFile = parentDocFile.findFile(segment)
+                    var childDocFile = parentDocFile?.findFile(segment)
                     if (childDocFile == null) {
-                        childDocFile = parentDocFile.createDirectory(segment)
+                        childDocFile = parentDocFile?.createDirectory(segment)
                         if (childDocFile == null) {
                             Log.e("DevicesViewModel", "Failed to create directory: $segment in ${state.destinationBaseUri}")
                             _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "Cannot receive ${state.relativePath}: Failed to create directory $segment."))
@@ -1389,10 +1409,12 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     parentDocFile = childDocFile
                 }
 
-                var targetDocFile = parentDocFile.findFile(fileName)
+                var targetDocFile = parentDocFile?.findFile(fileName)
                 if (targetDocFile == null) {
-                    val mimeType = "application/octet-stream"
-                    targetDocFile = parentDocFile.createFile(mimeType, fileName)
+                    // --- Use correct MIME type ---
+                    val extension = fileName.substringAfterLast('.', "")
+                    val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension.lowercase()) ?: "application/octet-stream"
+                    targetDocFile = parentDocFile?.createFile(mimeType, fileName)
                 }
 
                 if (targetDocFile == null || !targetDocFile.canWrite()) {
@@ -1400,7 +1422,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "Cannot create/write target file: ${state.relativePath}."))
                     return
                 }
-                currentFileOutputStream = context.contentResolver.openOutputStream(targetDocFile.uri, if (state.bytesReceived > 0) "wa" else "w")
+                // --- Always open in 'w' mode, only once per file ---
+                currentFileOutputStream = context.contentResolver.openOutputStream(targetDocFile.uri, "w")
 
                 if (currentFileOutputStream == null) {
                     Log.e("DevicesViewModel", "Failed to open OutputStream for ${targetDocFile.uri}")
@@ -1408,8 +1431,15 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     return
                 }
                 Log.d("DevicesViewModel", "Receiving to file: ${targetDocFile.uri} (size: ${state.totalSize})")
+                // --- Store for media scan after finalize ---
+                stateMediaScanUri = targetDocFile.uri
+                // Store the file's uri for later logging
+                stateFileUriForDebug = targetDocFile.uri
             }
 
+            // --- Log chunk size and first 16 bytes ---
+            val firstBytes = chunk.take(16).joinToString(" ") { String.format("%02x", it) }
+            Log.d("DevicesViewModel", "Writing chunk of size ${chunk.size} to ${state.relativePath}, first 16 bytes: $firstBytes")
             currentFileOutputStream?.write(chunk)
             state.bytesReceived += chunk.size
             Log.d("DevicesViewModel", "Received ${state.bytesReceived}/${state.totalSize} for ${state.relativePath} in folder ${state.folderName}")
@@ -1429,6 +1459,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    // --- Store the last written file's URI for media scan and debug ---
+    private var stateMediaScanUri: android.net.Uri? = null
+    private var stateFileUriForDebug: android.net.Uri? = null
 
     private fun finalizeReceivedFile() {
         val state = currentReceivingFile ?: return
@@ -1442,12 +1475,35 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             } else {
                  _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "File Received", details = "File ${state.relativePath} received successfully."))
             }
+            // --- Log first 16 bytes of the written file ---
+            stateFileUriForDebug?.let { uri ->
+                try {
+                    val context = getApplication<Application>().applicationContext
+                    context.contentResolver.openInputStream(uri)?.use { fis ->
+                        val buf = ByteArray(16)
+                        val n = fis.read(buf)
+                        val hex = buf.take(n).joinToString(" ") { String.format("%02x", it) }
+                        Log.d("DevicesViewModel", "First $n bytes of written file ${state.relativePath}: $hex")
+                    }
+                } catch (e: Exception) {
+                    Log.e("DevicesViewModel", "Error reading first bytes of written file: ${e.message}")
+                }
+            }
+            // --- Trigger media scan if file is an image or media ---
+            stateMediaScanUri?.let { uri ->
+                val scanIntent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)
+                scanIntent.data = uri
+                getApplication<Application>().applicationContext.sendBroadcast(scanIntent)
+                Log.d("DevicesViewModel", "Media scan triggered for $uri")
+                stateMediaScanUri = null
+            }
         } catch (e: IOException) {
             Log.e("DevicesViewModel", "IOException finalizing file ${state.relativePath}: ${e.message}", e)
             _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "IOException finalizing file ${state.relativePath}: ${e.message}"))
         } finally {
             currentFileOutputStream = null
             currentReceivingFile = null
+            stateFileUriForDebug = null
         }
     }
 
@@ -1464,8 +1520,15 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     private fun sendMessage(message: SyncMessage) {
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             try {
-                objectOutputStream?.writeObject(message)
-                objectOutputStream?.flush()
+                synchronized(outputStreamLock) {
+                    if (message.type == MessageType.FILE_CHUNK) {
+                        val chunk = message.fileChunkData
+                        Log.d("DevicesViewModel", "sendMessage: FILE_CHUNK, chunk size: ${chunk?.size}, first 8 bytes: ${chunk?.take(8)?.joinToString(" ") { String.format("%02x", it) }}, last 8 bytes: ${chunk?.takeLast(8)?.joinToString(" ") { String.format("%02x", it) }}")
+                        objectOutputStream?.reset()
+                    }
+                    objectOutputStream?.writeObject(message)
+                    objectOutputStream?.flush()
+                }
                 Log.d("DevicesViewModel", "Sent message: Type: ${message.type}, Folder: ${message.folderName}")
             } catch (e: IOException) {
                 Log.e("DevicesViewModel", "Error sending message: ${e.message}", e)
@@ -1492,5 +1555,14 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             catch (e: Exception) { Log.w("DevicesViewModel", "Ex onCleared/stopP2pDisc: ${e.message}")}
         }
         Log.d("DevicesViewModel", "onCleared finished.")
+    }
+
+    // Add a public function to retry pending sync after folder mapping
+    fun retryPendingSyncIfNeeded() {
+        val msg = pendingSyncMessage
+        if (msg != null && pendingFolderMapping.value == null) {
+            pendingSyncMessage = null
+            handleIncomingMessage(msg)
+        }
     }
 }
