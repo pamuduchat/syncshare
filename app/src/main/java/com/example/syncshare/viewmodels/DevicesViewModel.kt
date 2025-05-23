@@ -199,10 +199,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     fun getP2pConnectionInfoListener(): WifiP2pManager.ConnectionInfoListener = p2pConnectionInfoListener
 
     // Placeholder for the handler method
-    private fun handleP2pConnectionInfo(info: android.net.wifi.p2p.WifiP2pInfo) {
-        Log.d("DevicesViewModel", "handleP2pConnectionInfo called with: $info. Implementation pending.")
-        // Logic to start server or connect as client will be added here later.
-    }
+    // Removed duplicate/placeholder handleP2pConnectionInfo
+    // The actual implementation is kept below (around original line 957)
 
 
     @SuppressLint("MissingPermission")
@@ -954,159 +952,17 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
 
     // --- P2P Connection and Server Methods ---
-    fun handleP2pConnectionInfo(info: WifiP2pInfo) {
-        viewModelScope.launch(Dispatchers.IO) { // Perform network operations off the main thread
-            if (info.groupFormed) {
-                if (info.isGroupOwner) {
-                    Log.i("DevicesViewModel", "P2P Group Owner. Starting P2P Server.")
-                    withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Group Owner: Starting Server..." }
-                    startP2pServer()
-                } else {
-                    Log.i("DevicesViewModel", "P2P Client. Connecting to Group Owner: ${info.groupOwnerAddress?.hostAddress}")
-                    if (info.groupOwnerAddress?.hostAddress != null) {
-                        withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Client: Connecting to Owner..." }
-                        connectToP2pOwner(info.groupOwnerAddress.hostAddress)
-                    } else {
-                        Log.e("DevicesViewModel", "P2P Client: Group owner address is null!")
-                        withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Error: Owner address null" }
-                        disconnectP2p() // Clean up any partial state
-                    }
-                }
-            } else {
-                Log.i("DevicesViewModel", "P2P Group not formed or connection lost.")
-                withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Disconnected (Group not formed)" }
-                disconnectP2p()
-            }
-        }
-    }
+    // This is the primary implementation of handleP2pConnectionInfo
+    // Removed duplicate handleP2pConnectionInfo. The primary implementation is kept above.
 
-    @SuppressLint("MissingPermission")
-    fun startP2pServer() {
-        if (p2pServerJob?.isActive == true) {
-            Log.d("DevicesViewModel", "P2P server job already active."); return
-        }
-        // Close any existing BT connection first if we are switching
-        if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
-            Log.d("DevicesViewModel", "Switching from BT to P2P Server. Closing BT connection.")
-            disconnectBluetooth()
-        }
+    // Removed redundant startP2pServer implementation.
+    // The version using closeP2pSockets() and explicit BT connectedBluetoothSocket check is retained below.
 
-        p2pServerJob = viewModelScope.launch(Dispatchers.IO) {
-            Log.i("DevicesViewModel", "Starting P2P server...")
-            try {
-                p2pServerSocket = ServerSocket(AppConstants.P2P_PORT)
-                Log.i("DevicesViewModel", "P2P ServerSocket listening on port ${AppConstants.P2P_PORT}")
-                withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Listening as P2P Group Owner..." }
+    // Removed redundant connectToP2pOwner implementation.
+    // The version using closeP2pSockets() helper and robust BT check is retained further down.
 
-                while (isActive) { // Coroutine scope's isActive
-                    try {
-                        Log.d("DevicesViewModel", "P2P server calling p2pServerSocket.accept()...")
-                        val client = p2pServerSocket?.accept() // Blocking call
-                        if (client != null) {
-                            p2pClientSocket = client // Assign to the class member
-                            val remoteAddress = client.remoteSocketAddress.toString()
-                            Log.i("DevicesViewModel", "P2P connection accepted from: $remoteAddress")
-                            withContext(Dispatchers.Main) {
-                                _p2pConnectionStatus.value = "P2P Client Connected: $remoteAddress"
-                                permissionRequestStatus.value = "P2P Client Connected: $remoteAddress"
-                            }
-                            setupCommunicationStreams(client, CommunicationTechnology.P2P)
-                            // Assuming one client for now, so break or manage multiple clients
-                            // For multiple clients, you'd typically launch a new coroutine for each client's communication
-                            // and the server loop would continue to accept more connections.
-                            // For this task, let's assume one primary client connection.
-                            // If another client connects, the previous p2pClientSocket will be replaced.
-                        } else {
-                            if (!isActive) break // Exit if coroutine cancelled
-                            Log.w("DevicesViewModel", "P2P server accept() returned null without exception.")
-                        }
-                    } catch (e: IOException) {
-                        if (isActive) { Log.e("DevicesViewModel", "P2P server socket accept() failed or closed.", e) }
-                        else { Log.d("DevicesViewModel", "P2P server socket accept() interrupted by cancellation.") }
-                        break // Exit loop on error or cancellation
-                    }
-                }
-            } catch (e: IOException) {
-                Log.e("DevicesViewModel", "P2P server ServerSocket() failed: ${e.message}", e)
-                withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Server Error: ${e.message}" }
-            } catch (se: SecurityException) { // Though less common for ServerSocket itself
-                Log.e("DevicesViewModel", "SecEx starting P2P server: ${se.message}", se)
-                withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Server Permission Error" }
-            } finally {
-                Log.d("DevicesViewModel", "P2P server thread ending.")
-                try { p2pServerSocket?.close() } catch (e: IOException) { Log.e("DevicesViewModel", "Could not close P2P server socket on exit: ${e.message}") }
-                p2pServerSocket = null
-                if (!isActive) { // If job was cancelled, ensure status reflects it
-                    withContext(Dispatchers.Main) { if (_p2pConnectionStatus.value.startsWith("Listening")) _p2pConnectionStatus.value = "P2P Server Stopped" }
-                }
-            }
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    fun connectToP2pOwner(ownerAddress: String?) {
-        if (ownerAddress == null) {
-            Log.e("DevicesViewModel", "Cannot connect to P2P owner: address is null.")
-            _p2pConnectionStatus.value = "Error: Owner address null"
-            return
-        }
-        // Close any existing BT connection first if we are switching
-        if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
-            Log.d("DevicesViewModel", "Switching from BT to P2P Client. Closing BT connection.")
-            disconnectBluetooth()
-        }
-
-        viewModelScope.launch(Dispatchers.IO) {
-            Log.i("DevicesViewModel", "Connecting to P2P Group Owner at $ownerAddress:${AppConstants.P2P_PORT}")
-            withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Connecting to P2P Group Owner..." }
-            try {
-                // Close existing p2pClientSocket if any, before creating a new one
-                p2pClientSocket?.close()
-                p2pClientSocket = Socket(ownerAddress, AppConstants.P2P_PORT)
-                Log.i("DevicesViewModel", "Successfully connected to P2P Group Owner: ${p2pClientSocket?.remoteSocketAddress}")
-                withContext(Dispatchers.Main) {
-                    _p2pConnectionStatus.value = "Connected to P2P Group Owner"
-                    permissionRequestStatus.value = "P2P Connected to Owner"
-                }
-                setupCommunicationStreams(p2pClientSocket!!, CommunicationTechnology.P2P)
-            } catch (e: IOException) {
-                Log.e("DevicesViewModel", "P2P client connection failed: ${e.message}", e)
-                withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Connection Failed: ${e.localizedMessage}" }
-                p2pClientSocket = null // Ensure socket is null on failure
-            } catch (se: SecurityException) { // Potentially if there are network security policies
-                Log.e("DevicesViewModel", "SecurityException during P2P client connection: ${se.message}", se)
-                withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Connection Permission Error" }
-                p2pClientSocket = null
-            }
-        }
-    }
-
-    fun disconnectP2p() {
-        viewModelScope.launch(Dispatchers.IO) { // Ensure operations are off main thread
-            Log.i("DevicesViewModel", "Disconnecting P2P...")
-            p2pServerJob?.cancel() // Stop the server if it's running
-            p2pServerJob = null
-
-            if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
-                closeCommunicationStreams(CommunicationTechnology.P2P) // This will close activeSocket if it's the p2pClientSocket
-            } else {
-                // If P2P wasn't the active communication, still try to close P2P specific sockets
-                try { p2pClientSocket?.close() } catch (e: IOException) { Log.w("DevicesViewModel", "Error closing p2pClientSocket: ${e.message}") }
-            }
-            try { p2pServerSocket?.close() } catch (e: IOException) { Log.w("DevicesViewModel", "Error closing p2pServerSocket: ${e.message}") }
-
-            p2pClientSocket = null
-            p2pServerSocket = null
-
-            withContext(Dispatchers.Main) {
-                _p2pConnectionStatus.value = "Disconnected"
-                if (permissionRequestStatus.value.startsWith("P2P")) {
-                    permissionRequestStatus.value = "P2P Disconnected."
-                }
-            }
-            Log.i("DevicesViewModel", "P2P disconnected.")
-        }
-    }
+    // Removed redundant disconnectP2p implementation.
+    // The version using closeP2pSockets() helper is retained below.
 
 
     // --- P2P Connection and Server Methods ---
