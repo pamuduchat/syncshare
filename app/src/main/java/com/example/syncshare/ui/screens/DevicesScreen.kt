@@ -10,6 +10,7 @@ import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pGroup
 import android.provider.Settings
 import android.util.Log
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -39,6 +40,8 @@ import com.example.syncshare.utils.isLocationEnabled
 import com.example.syncshare.utils.rememberPermissionsLauncher
 import com.example.syncshare.viewmodels.DevicesViewModel
 import kotlinx.coroutines.launch
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.ActivityResultLauncher
 
 @SuppressLint("MissingPermission")
 @Composable
@@ -62,6 +65,39 @@ fun DevicesScreen(
         mutableStateOf(isLocationEnabled(context))
     }
 
+    val pendingFolder = viewModel.pendingFolderMapping.value
+    val folderPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree(),
+        onResult = { uri: android.net.Uri? ->
+            if (uri != null && pendingFolder != null) {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+                viewModel.setDestinationUriForSync(pendingFolder, uri)
+                viewModel.pendingFolderMapping.value = null
+                viewModel.retryPendingSyncIfNeeded()
+            }
+        }
+    )
+
+    if (pendingFolder != null) {
+        AlertDialog(
+            onDismissRequest = { viewModel.pendingFolderMapping.value = null },
+            title = { Text("Select Destination Folder") },
+            text = { Text("Please select a destination folder for incoming sync: '$pendingFolder'") },
+            confirmButton = {
+                Button(onClick = { folderPickerLauncher.launch(null) }) {
+                    Text("Choose Folder")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { viewModel.pendingFolderMapping.value = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 
     val wifiDirectPermissionsLauncher = rememberPermissionsLauncher { permissionsResult ->
         var allGranted = true
@@ -212,22 +248,11 @@ fun DevicesScreen(
                 Text(if (p2pGroupInfo != null) "Refresh Group" else "Scan P2P")
             }
 
-            Button(onClick = {
-                // This would be inside the click handler of a button available after connection
-                // Or triggered automatically after connection by observing connection state
-                if (viewModel.bluetoothConnectionStatus.value.startsWith("Connected")) { // Or "Accepted connection"
-                    Log.d("DevicesScreen", "Initiating sync for 'MyFolder'")
-                    viewModel.initiateSyncRequest("MyFolder") // New method in ViewModel
-                }
-            }) {
-                Text("Sync MyFolder with Peer")
-            }
-
             Button(
                 onClick = {
                     Log.d("DevicesScreen", "Bluetooth Scan button clicked.")
                     val perms = getBluetoothPermissions()
-                    if (perms.all { ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }) {
+                    if (perms.all { context.hasPermission(it) }) {
                         try { viewModel.startBluetoothDiscovery() } catch (e: SecurityException) { Log.e("DevicesScreen", "SecEx BT Scan: ${e.message}", e) }
                     } else {
                         bluetoothPermissionsLauncher.launch(perms)
@@ -304,17 +329,20 @@ fun DevicesScreen(
                                 }
                                 DeviceTechnology.BLUETOOTH_CLASSIC -> {
                                     val btDevice = device.originalDeviceObject as? BluetoothDevice
-                                    btDevice?.let {
-                                        Log.d("DevicesScreen", "Attempting BT connect to: ${it.name ?: it.address}")
-                                        viewModel.connectToBluetoothDevice(it)
+                                    val perms = getBluetoothPermissions()
+                                    if (perms.all { context.hasPermission(it) }) {
+                                        btDevice?.let {
+                                            Log.d("DevicesScreen", "Attempting BT connect to: ${it.name ?: it.address}")
+                                            viewModel.connectToBluetoothDevice(it)
+                                        }
+                                    } else {
+                                        bluetoothPermissionsLauncher.launch(perms)
                                     }
                                 }
                                 DeviceTechnology.UNKNOWN -> {
                                     Log.w("DevicesScreen", "Clicked on device with UNKNOWN technology: ${device.name}")
                                     viewModel.permissionRequestStatus.value = "Cannot connect: Unknown device type."
                                 }
-
-                                // Add 'else -> {}' or handle any other DeviceTechnology types you add
                             }
                         } catch (e: SecurityException) {
                             Log.e("DevicesScreen", "SecurityException on item click connect: ${e.message}", e)
