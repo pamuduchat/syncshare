@@ -360,6 +360,7 @@ fun DevicesScreen(
     Log.d("DevicesScreen", "DevicesScreen Composable INVOKED - END")
 }
 
+// DeviceItem and getDeviceStatus functions (ensure they are correctly defined as before)
 @Composable
 fun UnifiedDeviceItem(displayableDevice: DisplayableDevice, onClick: () -> Unit) {
     Row(

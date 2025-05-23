@@ -616,6 +616,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 try { btServerSocket?.close() } catch (e: IOException) { Log.e("DevicesViewModel", "Could not close BT server socket on exit: ${e.message}") }
                 btServerSocket = null
             }
+        } else {
+            Log.d("DevicesViewModel", "Receiver was already null.")
         }
     }
 
@@ -1538,6 +1540,71 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
         }
+    }
+
+
+    /**
+     * Check the overall status of Wi-Fi Direct subsystem
+     * This can be called whenever there's an issue to report system status
+     */
+    fun checkWifiDirectStatus(): String { // Return String for potential UI display or testing
+        Log.i("DevicesViewModel", "checkWifiDirectStatus() - Running diagnostic check")
+        val context = getApplication<Application>().applicationContext
+        val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+
+        val isWifiEnabled = wifiManager?.isWifiEnabled ?: false
+        val diagnosticInfo = StringBuilder()
+        diagnosticInfo.append("Wi-Fi Direct Diagnostics:\n")
+        diagnosticInfo.append("- Wi-Fi Enabled: $isWifiEnabled\n")
+        diagnosticInfo.append("- WifiP2pManager: ${if (wifiP2pManager != null) "Initialized" else "NULL"}\n")
+        diagnosticInfo.append("- Channel: ${if (channel != null) "Active" else "NULL or Disconnected"}\n")
+        diagnosticInfo.append("- Broadcast Receiver: ${if (receiver != null) "Registered Instance Present" else "Not Registered or Null Instance"}\n")
+
+        val androidVersion = Build.VERSION.SDK_INT
+        diagnosticInfo.append("- Android API Level: $androidVersion (${Build.VERSION.RELEASE})\n")
+
+        var permsOk = true
+        getWifiDirectPermissions().forEach { perm ->
+            val granted = context.hasPermission(perm)
+            diagnosticInfo.append("- Permission '$perm': $granted\n")
+            if (!granted) permsOk = false
+        }
+
+        val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as? android.location.LocationManager
+        var isLocationEnabled = false
+        if (locationManager != null) {
+            isLocationEnabled = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                locationManager.isLocationEnabled // API 28+
+            } else {
+                // For older versions, check specific providers
+                try {
+                    val gpsEnabled = locationManager.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER)
+                    val networkEnabled = locationManager.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)
+                    gpsEnabled || networkEnabled
+                } catch (e: Exception) { false }
+            }
+        }
+        diagnosticInfo.append("- System Location Enabled: $isLocationEnabled\n")
+// ...
+        if (!isLocationEnabled) {
+            // Prepend or append this to permissionRequestStatus.value
+            // This is a critical piece of info for the user.
+            val currentStatus = permissionRequestStatus.value
+            permissionRequestStatus.value = "Error: System Location is OFF. Please enable it. ($currentStatus)"
+        }
+
+        Log.i("DevicesViewModel", diagnosticInfo.toString())
+
+        // Update UI with brief status if diagnostics reveal issues
+        if (!isWifiEnabled) {
+            permissionRequestStatus.value = "Error: Wi-Fi is disabled."
+        } else if (!permsOk) {
+            permissionRequestStatus.value = "Error: Required P2P permissions missing."
+        } else if (wifiP2pManager == null || channel == null) {
+            permissionRequestStatus.value = "Error: P2P system not ready. Try reset."
+        }
+        // If all checks pass, don't override current status unless it's an error one
+        return diagnosticInfo.toString()
     }
 
 
