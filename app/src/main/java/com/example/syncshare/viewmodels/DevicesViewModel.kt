@@ -27,19 +27,31 @@ import androidx.core.app.ActivityCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.syncshare.features.WifiDirectBroadcastReceiver
+import com.example.syncshare.protocol.FileMetadata
+import com.example.syncshare.protocol.FileTransferInfo
+import com.example.syncshare.protocol.MessageType
+import com.example.syncshare.protocol.SyncMessage
 import com.example.syncshare.ui.model.DeviceTechnology
 import com.example.syncshare.ui.model.DisplayableDevice
 import com.example.syncshare.utils.AppConstants
 import com.example.syncshare.utils.getBluetoothPermissions
 import com.example.syncshare.utils.getWifiDirectPermissions
 import com.example.syncshare.utils.isLocationEnabled
-import kotlinx.coroutines.Job // Import this
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.isActive // Import this
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.currentCoroutineContext
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.IOException
+import java.io.ObjectInputStream
+import java.io.ObjectOutputStream
 import java.util.UUID // For AppConstants if it's defined there
 
 class DevicesViewModel(application: Application) : AndroidViewModel(application) {
@@ -89,6 +101,10 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     // Internal storage
     private val wifiDirectPeersInternal = mutableStateListOf<WifiP2pDevice>()
     private val bluetoothDevicesInternal = mutableStateListOf<BluetoothDevice>()
+
+    private var objectOutputStream: ObjectOutputStream? = null
+    private var objectInputStream: ObjectInputStream? = null
+    private var communicationJob: Job? = null
 
     init {
         Log.d("DevicesViewModel", "DevicesViewModel - INIT BLOCK - START")
@@ -519,6 +535,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
     fun disconnectBluetooth() { /* ... as before ... */
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            closeCommunicationStreams()
             try { connectedBluetoothSocket?.close(); Log.i("DevicesViewModel", "Bluetooth socket closed.") }
             catch (e: IOException) { Log.e("DevicesViewModel", "Could not close connected Bluetooth socket", e) }
             finally { connectedBluetoothSocket = null; launch(kotlinx.coroutines.Dispatchers.Main) { _bluetoothConnectionStatus.value = "Disconnected" } }
@@ -569,17 +586,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 try { btServerSocket?.close() } catch (e: IOException) { Log.e("DevicesViewModel", "Could not close BT server socket on exit: ${e.message}") }
                 btServerSocket = null
             }
-        }
-    }
-
-    private fun handleAcceptedBluetoothConnection(socket: BluetoothSocket) {
-        val remoteDeviceName = try {socket.remoteDevice.name} catch(e:SecurityException){null} ?: socket.remoteDevice.address
-        Log.i("DevicesViewModel", "Handling accepted BT connection from $remoteDeviceName")
-        connectedBluetoothSocket = socket // Manages one connection at a time for now
-        viewModelScope.launch(kotlinx.coroutines.Dispatchers.Main) {
-            _bluetoothConnectionStatus.value = "Accepted connection from $remoteDeviceName"
-            permissionRequestStatus.value = "BT Peer connected: $remoteDeviceName"
-            // TODO: Start data transfer logic on this socket
         }
     }
 
@@ -748,6 +754,357 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         return diagnosticInfo.toString()
     }
 
+
+    private fun setupCommunicationStreams(socket: BluetoothSocket) { // Adapt for WifiP2pSocket later
+        Log.d("DevicesViewModel", "Setting up communication streams for Bluetooth socket.")
+        try {
+            // IMPORTANT: Get OutputStream first, then InputStream, or vice-versa consistently on both ends.
+            // It can sometimes deadlock if done in opposite orders.
+            objectOutputStream = ObjectOutputStream(socket.outputStream)
+            objectOutputStream?.flush() // Flush to send header if any
+            objectInputStream = ObjectInputStream(socket.inputStream)
+            Log.i("DevicesViewModel", "Communication streams established.")
+            permissionRequestStatus.value = "Streams open. Ready to sync."
+
+            // Start listening for incoming messages in a separate coroutine
+            startListeningForMessages()
+
+        } catch (e: IOException) {
+            Log.e("DevicesViewModel", "Error setting up communication streams: ${e.message}", e)
+            permissionRequestStatus.value = "Error: Stream setup failed."
+            disconnectBluetooth() // Or a generic disconnect
+        }
+    }
+
+    private fun startListeningForMessages() {
+        communicationJob?.cancel() // Cancel any previous listener
+        communicationJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            Log.i("DevicesViewModel", "Listening for incoming SyncMessages...")
+            while (isActive && objectInputStream != null) { // Check coroutine isActive
+                try {
+                    val message = objectInputStream?.readObject() as? SyncMessage
+                    message?.let {
+                        Log.d("DevicesViewModel", "Received message: Type: ${it.type}, Folder: ${it.folderName}")
+                        handleIncomingMessage(it)
+                    }
+                } catch (e: IOException) {
+                    if (isActive) { // Don't log error if coroutine was cancelled (socket closed)
+                        Log.e("DevicesViewModel", "IOException while listening for messages: ${e.message}", e)
+                        launch(kotlinx.coroutines.Dispatchers.Main) { permissionRequestStatus.value = "Connection lost: ${e.message}" }
+                    }
+                    break // Exit loop on error
+                } catch (e: ClassNotFoundException) {
+                    Log.e("DevicesViewModel", "ClassNotFoundException while listening: ${e.message}", e)
+                    launch(kotlinx.coroutines.Dispatchers.Main) { permissionRequestStatus.value = "Protocol error." }
+                    break
+                } catch (e: Exception) { // Catch any other unexpected errors
+                    if (isActive) {
+                        Log.e("DevicesViewModel", "Unexpected error listening for messages: ${e.message}", e)
+                        launch(kotlinx.coroutines.Dispatchers.Main) { permissionRequestStatus.value = "Communication error."}
+                    }
+                    break
+                }
+            }
+            Log.i("DevicesViewModel", "Stopped listening for messages.")
+            // If loop exited, connection is likely lost or closed
+            if (connectedBluetoothSocket != null || p2pIsConnected()) { // Check if we thought we were connected
+                launch(kotlinx.coroutines.Dispatchers.Main) {
+                    if (_bluetoothConnectionStatus.value.startsWith("Connected")) _bluetoothConnectionStatus.value = "Disconnected (stream ended)"
+                    // Handle P2P disconnect status similarly
+                }
+            }
+        }
+    }
+
+    private fun p2pIsConnected(): Boolean { // Placeholder for P2P connection state
+        // TODO: Implement actual P2P connection state check
+        return false
+    }
+
+
+    private fun handleIncomingMessage(message: SyncMessage) {
+        // Switch to Dispatchers.Main for UI updates from permissionRequestStatus
+        // but launch IO-bound tasks like sendFile on Dispatchers.IO
+        viewModelScope.launch(Dispatchers.Main) {
+            when (message.type) {
+                MessageType.SYNC_REQUEST_METADATA -> {
+                    Log.d("DevicesViewModel", "Received SYNC_REQUEST_METADATA for folder: ${message.folderName}")
+                    permissionRequestStatus.value = "Received sync request for '${message.folderName}'"
+                    // Launch the comparison and response in an IO context
+                    launch(Dispatchers.IO) {
+                        val localFilesToCompare = getLocalFileMetadata(message.folderName ?: "")
+                        val remoteFileMetadata = message.fileMetadataList ?: emptyList()
+                        val filesToRequest = mutableListOf<String>()
+                        val localFileMap = localFilesToCompare.associateBy { it.relativePath }
+                        remoteFileMetadata.forEach { remoteFile -> val localFile = localFileMap[remoteFile.relativePath]; if (localFile == null || remoteFile.lastModified > localFile.lastModified) { filesToRequest.add(remoteFile.relativePath) } }
+                        Log.d("DevicesViewModel", "Requesting ${filesToRequest.size} files: $filesToRequest")
+                        sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = message.folderName, requestedFilePaths = filesToRequest))
+                    }
+                }
+                MessageType.FILES_REQUESTED_BY_PEER -> {
+                    Log.d("DevicesViewModel", "Received FILES_REQUESTED_BY_PEER for folder: ${message.folderName}")
+                    val requestedPaths = message.requestedFilePaths
+                    permissionRequestStatus.value = "Peer requested ${requestedPaths?.size ?: 0} files."
+                    requestedPaths?.forEach { relativePath ->
+                        // Launch each sendFile in its own IO coroutine
+                        launch(Dispatchers.IO) {
+                            sendFile(message.folderName ?: "", relativePath)
+                        }
+                    }
+                    // More robust: track completion of all sendFile jobs before sending SYNC_COMPLETE
+                    if (requestedPaths.isNullOrEmpty()){
+                        sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = message.folderName))
+                    } else {
+                        // TODO: Implement tracking for when all files initiated by this request are sent, then send SYNC_COMPLETE
+                        Log.d("DevicesViewModel", "TODO: Need to track completion of ${requestedPaths.size} file sends before sending SYNC_COMPLETE.")
+                    }
+                }
+                // ... (other message types handling as before) ...
+                MessageType.FILE_TRANSFER_START -> {
+                    val info = message.fileTransferInfo; Log.i("DevicesViewModel", "Receiving file: ${info?.relativePath}, Size: ${info?.fileSize}"); permissionRequestStatus.value = "Receiving: ${info?.relativePath}"; currentReceivingFile = FileTransferState(message.folderName!!, info!!.relativePath, info.fileSize)
+                }
+                MessageType.FILE_CHUNK -> { message.fileChunkData?.let { appendFileChunk(it) } }
+                MessageType.FILE_TRANSFER_END -> {
+                    val info = message.fileTransferInfo; Log.i("DevicesViewModel", "File transfer finished for: ${info?.relativePath}"); permissionRequestStatus.value = "Received: ${info?.relativePath}"; finalizeReceivedFile(); info?.let { sendMessage(SyncMessage(MessageType.FILE_RECEIVED_ACK, fileTransferInfo = FileTransferInfo(it.relativePath, 0L)))}; currentReceivingFile = null
+                }
+                MessageType.FILE_RECEIVED_ACK -> { Log.i("DevicesViewModel", "Peer ACKed file: ${message.fileTransferInfo?.relativePath}") /* TODO: Track sent files */ }
+                MessageType.SYNC_COMPLETE -> { Log.i("DevicesViewModel", "SYNC_COMPLETE received for folder: ${message.folderName}"); permissionRequestStatus.value = "Sync complete for '${message.folderName}'."; _isRefreshing.value = false }
+                MessageType.ERROR_MESSAGE -> { Log.e("DevicesViewModel", "Received ERROR_MESSAGE: ${message.errorMessage}"); permissionRequestStatus.value = "Error from peer: ${message.errorMessage}" }
+            }
+        }
+    }
+    private fun handleAcceptedBluetoothConnection(socket: BluetoothSocket) {
+        val remoteDeviceName = try {socket.remoteDevice.name} catch(e:SecurityException){null} ?: socket.remoteDevice.address
+        Log.i("DevicesViewModel", "Handling accepted BT connection from $remoteDeviceName")
+        // This function is already on an IO thread from startBluetoothServer's launch
+        // If managing multiple connections, create a new coroutine for each.
+        // For one connection:
+        connectedBluetoothSocket = socket //
+        setupCommunicationStreams(socket) // Setup streams directly
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.Main) { // Update UI for accepted connection
+            _bluetoothConnectionStatus.value = "Accepted connection from $remoteDeviceName"
+            permissionRequestStatus.value = "BT Peer connected: $remoteDeviceName"
+        }
+    }
+
+
+    // --- Placeholder for File Handling ---
+    // Needs to be implemented based on your actual folder structure and SAF URIs
+    private fun getLocalFileMetadata(folderName: String): List<FileMetadata> {
+        Log.d("DevicesViewModel", "TODO: Implement getLocalFileMetadata for folder: $folderName")
+        // Example: If you have a root sync directory for this "folderName"
+        // val syncRootDir = File(getApplication<Application>().filesDir, "SyncShareRoot/$folderName")
+        // if (!syncRootDir.exists()) return emptyList()
+        //
+        // return syncRootDir.walkTopDown()
+        //     .filter { it.isFile }
+        //     .map { file ->
+        //         FileMetadata(
+        //             // relativePath needs to be calculated from syncRootDir
+        //             relativePath = file.relativeTo(syncRootDir).path,
+        //             name = file.name,
+        //             size = file.length(),
+        //             lastModified = file.lastModified()
+        //         )
+        //     }.toList()
+        return emptyList() // Placeholder
+    }
+
+    fun initiateSyncRequest(folderName: String) {
+        if (objectOutputStream == null) {
+            Log.e("DevicesViewModel", "Cannot initiate sync: Communication streams not ready.")
+            permissionRequestStatus.value = "Error: Not connected for sync."
+            return
+        }
+        viewModelScope.launch { // Use viewModelScope for the initial part
+            permissionRequestStatus.value = "Preparing to sync folder: $folderName"
+            _isRefreshing.value = true // Indicate sync activity
+
+            // Get metadata for the local folder to be synced
+            // This part might be slow if many files, consider Dispatchers.IO if it blocks UI thread for too long
+            val localMetadata = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                getLocalFileMetadata(folderName)
+            }
+
+            if (localMetadata.isEmpty()) {
+                Log.w("DevicesViewModel", "No files to sync in folder: $folderName")
+                sendMessage(SyncMessage(MessageType.SYNC_REQUEST_METADATA, folderName = folderName, fileMetadataList = emptyList()))
+                // Depending on protocol, you might send SYNC_COMPLETE immediately or wait for peer.
+                // For now, let peer respond even if list is empty.
+                // _isRefreshing.value = false; // Or wait for peer's response
+                return@launch
+            }
+
+            Log.d("DevicesViewModel", "Sending SYNC_REQUEST_METADATA for $folderName with ${localMetadata.size} files.")
+            sendMessage(
+                SyncMessage(
+                    type = MessageType.SYNC_REQUEST_METADATA,
+                    folderName = folderName,
+                    fileMetadataList = localMetadata
+                )
+            )
+            // _isRefreshing remains true, will be set to false upon SYNC_COMPLETE from peer or error/timeout
+        }
+    }
+
+    private suspend fun sendFile(folderName: String, relativePath: String) {
+        Log.d("DevicesViewModel", "sendFile: $folderName/$relativePath")
+        val appFilesDir = getApplication<Application>().filesDir
+        val syncShareRoot = File(appFilesDir, "SyncShareRoot")
+        val folderDir = File(syncShareRoot, folderName)
+        val localFile = File(folderDir, relativePath)
+
+        // Check if the current coroutine is active at the beginning
+        if (!currentCoroutineContext().isActive) {
+            Log.w("DevicesViewModel", "sendFile for $relativePath called but coroutine is already inactive.")
+            return
+        }
+
+        if (!localFile.exists() || !localFile.isFile) {
+            Log.e("DevicesViewModel", "File not found or is not a file: ${localFile.absolutePath}")
+            if (currentCoroutineContext().isActive) { // Check before sending message
+                sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, errorMessage = "File not found on sender: $relativePath"))
+            }
+            return
+        }
+
+        val transferInfo = FileTransferInfo(relativePath, localFile.length())
+        sendMessage(SyncMessage(MessageType.FILE_TRANSFER_START, folderName = folderName, fileTransferInfo = transferInfo))
+
+        withContext(Dispatchers.Main) {
+            permissionRequestStatus.value = "Sending: $relativePath..."
+        }
+
+        val bufferSize = 4096
+        val buffer = ByteArray(bufferSize)
+        var bytesRead: Int
+        var totalBytesSent: Long = 0
+
+        try {
+            FileInputStream(localFile).use { fis ->
+                // Use currentCoroutineContext().isActive
+                while (fis.read(buffer).also { bytesRead = it } != -1 && currentCoroutineContext().isActive) {
+                    val chunkToSend = if (bytesRead == bufferSize) buffer else buffer.copyOf(bytesRead)
+                    sendMessage(SyncMessage(MessageType.FILE_CHUNK, fileChunkData = chunkToSend))
+                    totalBytesSent += bytesRead
+                    delay(5)
+                }
+            }
+
+            if (!currentCoroutineContext().isActive) {
+                Log.w("DevicesViewModel", "File sending for $relativePath was cancelled during/after read loop.")
+                return
+            }
+            Log.i("DevicesViewModel", "Finished sending chunks for $relativePath, total $totalBytesSent bytes.")
+
+        } catch (e: IOException) {
+            Log.e("DevicesViewModel", "IOException during file send for $relativePath: ${e.message}", e)
+            if (currentCoroutineContext().isActive) {
+                sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, errorMessage = "Error sending file $relativePath: ${e.message}"))
+            }
+            return
+        } catch (e: Exception) {
+            Log.e("DevicesViewModel", "Unexpected exception during file send for $relativePath: ${e.message}", e)
+            if (currentCoroutineContext().isActive) {
+                sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, errorMessage = "Unexpected error sending file $relativePath: ${e.message}"))
+            }
+            return
+        }
+
+        if (currentCoroutineContext().isActive) {
+            sendMessage(SyncMessage(MessageType.FILE_TRANSFER_END, folderName = folderName, fileTransferInfo = transferInfo))
+            Log.i("DevicesViewModel", "Sent FILE_TRANSFER_END for $relativePath")
+            withContext(Dispatchers.Main) {
+                if (permissionRequestStatus.value.contains("Sending: $relativePath")) {
+                    permissionRequestStatus.value = "Sent: $relativePath"
+                }
+            }
+        } else {
+            Log.w("DevicesViewModel", "File sending for $relativePath was cancelled, FILE_TRANSFER_END not sent.")
+        }
+    }
+
+
+    // --- For Receiving Files ---
+    private var currentReceivingFile: FileTransferState? = null
+    private var currentFileOutputStream: FileOutputStream? = null
+
+    data class FileTransferState(val folderName: String, val relativePath: String, val totalSize: Long, var bytesReceived: Long = 0L)
+
+    private fun appendFileChunk(chunk: ByteArray) {
+        currentReceivingFile?.let { state ->
+            try {
+                if (currentFileOutputStream == null) {
+                    // Determine actual local path. For simplicity, using app's internal filesDir.
+                    // You'll need to map `state.folderName` and `state.relativePath` to a valid local file path.
+                    // Ensure parent directories exist.
+                    val targetDir = File(getApplication<Application>().filesDir, "SyncShareReceived/${state.folderName}")
+                    if (!targetDir.exists()) targetDir.mkdirs()
+                    val targetFile = File(targetDir, state.relativePath.substringAfterLast('/')) // Use only filename part for simplicity here
+                    currentFileOutputStream = FileOutputStream(targetFile, state.bytesReceived > 0) // Append if resuming
+                    Log.d("DevicesViewModel", "Receiving to file: ${targetFile.absolutePath}")
+                }
+                currentFileOutputStream?.write(chunk)
+                state.bytesReceived += chunk.size
+                Log.d("DevicesViewModel", "Received ${state.bytesReceived}/${state.totalSize} for ${state.relativePath}")
+                // Update UI progress if needed
+            } catch (e: IOException) {
+                Log.e("DevicesViewModel", "IOException writing file chunk for ${state.relativePath}: ${e.message}", e)
+                // TODO: Handle error, maybe send NACK or close stream
+                try { currentFileOutputStream?.close() } catch (ioe: IOException) {}
+                currentFileOutputStream = null
+                currentReceivingFile = null // Abort this file
+            }
+        }
+    }
+
+    private fun finalizeReceivedFile() {
+        currentReceivingFile?.let { state ->
+            try {
+                currentFileOutputStream?.flush()
+                currentFileOutputStream?.close()
+                Log.i("DevicesViewModel", "File ${state.relativePath} finalized. Total bytes: ${state.bytesReceived}/${state.totalSize}")
+                if (state.bytesReceived != state.totalSize) {
+                    Log.w("DevicesViewModel", "File size mismatch for ${state.relativePath}! Expected ${state.totalSize}, got ${state.bytesReceived}")
+                    // TODO: Handle incomplete file (e.g., delete it, request retry)
+                }
+            } catch (e: IOException) {
+                Log.e("DevicesViewModel", "IOException finalizing file ${state.relativePath}: ${e.message}", e)
+            }
+        }
+        currentFileOutputStream = null
+        currentReceivingFile = null
+    }
+
+    // --- Lifecycle clean up for communication streams ---
+    private fun closeCommunicationStreams() {
+        Log.d("DevicesViewModel", "Closing communication streams.")
+        communicationJob?.cancel() // Stop the listening coroutine
+        communicationJob = null
+        try { objectInputStream?.close() } catch (e: IOException) { Log.w("DevicesViewModel", "Error closing objectInputStream: ${e.message}") }
+        try { objectOutputStream?.close() } catch (e: IOException) { Log.w("DevicesViewModel", "Error closing objectOutputStream: ${e.message}") }
+        objectInputStream = null
+        objectOutputStream = null
+    }
+
+
+
+    // Helper to send a SyncMessage
+    private fun sendMessage(message: SyncMessage) {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                objectOutputStream?.writeObject(message)
+                objectOutputStream?.flush()
+                Log.d("DevicesViewModel", "Sent message: Type: ${message.type}, Folder: ${message.folderName}")
+            } catch (e: IOException) {
+                Log.e("DevicesViewModel", "Error sending message: ${e.message}", e)
+                launch(kotlinx.coroutines.Dispatchers.Main) { permissionRequestStatus.value = "Error sending data." }
+                // Consider disconnecting or signaling error
+            }
+        }
+    }
+
+
     override fun onCleared() {
         super.onCleared()
         Log.d("DevicesViewModel", "onCleared called.")
@@ -755,6 +1112,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         stopBluetoothDiscovery()
         disconnectBluetooth()
         stopBluetoothServer()
+        closeCommunicationStreams()
         if (p2pChannel != null && wifiP2pManager != null) {
             try { wifiP2pManager?.stopPeerDiscovery(p2pChannel, null) }
             catch (e: SecurityException) { Log.w("DevicesViewModel", "SecEx onCleared/stopP2pDisc: ${e.message}")}

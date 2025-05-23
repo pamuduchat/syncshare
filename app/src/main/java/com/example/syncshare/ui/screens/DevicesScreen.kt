@@ -212,6 +212,17 @@ fun DevicesScreen(
                 Text(if (p2pGroupInfo != null) "Refresh Group" else "Scan P2P")
             }
 
+            Button(onClick = {
+                // This would be inside the click handler of a button available after connection
+                // Or triggered automatically after connection by observing connection state
+                if (viewModel.bluetoothConnectionStatus.value.startsWith("Connected")) { // Or "Accepted connection"
+                    Log.d("DevicesScreen", "Initiating sync for 'MyFolder'")
+                    viewModel.initiateSyncRequest("MyFolder") // New method in ViewModel
+                }
+            }) {
+                Text("Sync MyFolder with Peer")
+            }
+
             Button(
                 onClick = {
                     Log.d("DevicesScreen", "Bluetooth Scan button clicked.")
