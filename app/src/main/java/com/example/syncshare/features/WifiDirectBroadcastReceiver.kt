@@ -73,7 +73,13 @@ class WifiDirectBroadcastReceiver(
                 // You might also want to call viewModel.requestCurrentP2pGroupInfo() here
                 // to update the group status if a connection changed.
                 if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                    viewModel.onP2pConnectionChanged() // ViewModel handles coroutine and permission check
+                    // Ensure manager and channel are not null, and viewModel's listener is accessible
+                    manager?.requestConnectionInfo(channel, viewModel.getP2pConnectionInfoListener())
+                    Log.d("WifiDirectReceiver", "Requested P2P connection info using listener from ViewModel.")
+                } else {
+                    Log.e("WifiDirectReceiver", "ACCESS_FINE_LOCATION permission NOT granted for WIFI_P2P_CONNECTION_CHANGED_ACTION.")
+                    // Optionally, inform ViewModel about the permission issue or handle appropriately
+                    // viewModel.onP2pConnectionInfoPermissionDenied() // Example
                 }
             }
             WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION -> {
