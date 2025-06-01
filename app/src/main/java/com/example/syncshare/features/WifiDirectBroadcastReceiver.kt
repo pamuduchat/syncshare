@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.net.wifi.p2p.WifiP2pDevice // Ensure this import is present
 import android.net.wifi.p2p.WifiP2pDeviceList // Import this for the peers object
 import android.net.wifi.p2p.WifiP2pManager
+import android.net.wifi.p2p.WifiP2pInfo
 import android.os.Build // For API level checks if needed for permissions
 import android.util.Log
 import androidx.core.app.ActivityCompat
@@ -65,21 +66,16 @@ class WifiDirectBroadcastReceiver(
             }
             WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
                 Log.d("WifiDirectReceiver", "WIFI_P2P_CONNECTION_CHANGED_ACTION received.")
-                // This is where you'd get NetworkInfo and WifiP2pInfo to see if a connection
-                // was formed and who the group owner is.
-                // manager?.requestConnectionInfo(channel, connectionInfoListener)
-                // We'll implement connectionInfoListener in the ViewModel later.
-                // For now, just log.
-                // You might also want to call viewModel.requestCurrentP2pGroupInfo() here
-                // to update the group status if a connection changed.
                 if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                    // Ensure manager and channel are not null, and viewModel's listener is accessible
-                    manager?.requestConnectionInfo(channel, viewModel.getP2pConnectionInfoListener())
-                    Log.d("WifiDirectReceiver", "Requested P2P connection info using listener from ViewModel.")
+                    Log.d("WifiDirectReceiver", "Requesting P2P connection info...")
+                    manager?.requestConnectionInfo(channel, object : WifiP2pManager.ConnectionInfoListener {
+                        override fun onConnectionInfoAvailable(info: WifiP2pInfo) {
+                            Log.i("WifiDirectReceiver", "Connection info available. Group formed: ${info.groupFormed}, Is GO: ${info.isGroupOwner}")
+                            viewModel.handleP2pConnectionInfo(info)
+                        }
+                    })
                 } else {
                     Log.e("WifiDirectReceiver", "ACCESS_FINE_LOCATION permission NOT granted for WIFI_P2P_CONNECTION_CHANGED_ACTION.")
-                    // Optionally, inform ViewModel about the permission issue or handle appropriately
-                    // viewModel.onP2pConnectionInfoPermissionDenied() // Example
                 }
             }
             WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION -> {
