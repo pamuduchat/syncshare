@@ -79,10 +79,10 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
     private var p2pDiscoveryRetryCount = 0
     private val MAX_P2P_DISCOVERY_RETRIES = 3
-    private val _p2pGroupInfo = MutableStateFlow<WifiP2pGroup?>(null)
-    val p2pGroupInfo: StateFlow<WifiP2pGroup?> = _p2pGroupInfo
     private var p2pDiscoveryTimeoutJob: Job? = null
     private val P2P_DISCOVERY_TIMEOUT_MS = 20000L
+    private var p2pContinuousDiscoveryJob: Job? = null
+    private val P2P_CONTINUOUS_DISCOVERY_INTERVAL_MS = 30000L
 
     private val bluetoothManager by lazy {
         application.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -159,7 +159,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     Log.e("DevicesViewModel", "************ P2P CHANNEL DISCONNECTED ************")
                     this@DevicesViewModel.p2pChannel = null
                     permissionRequestStatus.value = "P2P Channel Lost! Reset or restart app."
-                    _isRefreshing.value = false; wifiDirectPeersInternal.clear(); _p2pGroupInfo.value = null; updateDisplayableDeviceList()
+                    _isRefreshing.value = false; wifiDirectPeersInternal.clear(); updateDisplayableDeviceList()
                     p2pDiscoveryTimeoutJob?.cancel()
                 }
             })
@@ -167,84 +167,40 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
         if (p2pChannel == null) {  Log.e("DevicesViewModel", "P2P_INIT_FAIL: Channel is null after initialize."); permissionRequestStatus.value = "Error: P2P Channel failed to init.";  return }
         Log.d("DevicesViewModel", "P2P_INIT: Channel Initialized: $p2pChannel")
-        refreshP2pGroupInfoOnResume()
         if (isReset) {
             viewModelScope.launch { delay(300); registerP2pReceiver() }
         }
     }
 
-    fun refreshP2pGroupInfoOnResume() {
-        viewModelScope.launch {
-            Log.d("DevicesViewModel", "refreshP2pGroupInfoOnResume launching coroutine to update group info.")
-            updateCurrentP2pGroupInfo()
-        }
-    }
-    fun onP2pConnectionChanged() {
-        viewModelScope.launch {
-            Log.d("DevicesViewModel", "onP2pConnectionChanged() - will refresh group info and request connection info.")
-            updateCurrentP2pGroupInfo()
-            if (wifiP2pManager != null && p2pChannel != null) {
-                wifiP2pManager?.requestConnectionInfo(p2pChannel, getP2pConnectionInfoListener())
-            } else {
-                Log.w("DevicesViewModel", "Cannot request P2P connection info onP2pConnectionChanged: manager or channel is null.")
-            }
-        }
-    }
-
-    private val p2pConnectionInfoListener = WifiP2pManager.ConnectionInfoListener { info ->
-        Log.d("DevicesViewModel", "P2P Connection Info Available. Group formed: ${info.groupFormed}, Is owner: ${info.isGroupOwner}, Owner IP: ${info.groupOwnerAddress?.hostAddress}")
-        handleP2pConnectionInfo(info)
-    }
-
-    fun getP2pConnectionInfoListener(): WifiP2pManager.ConnectionInfoListener = p2pConnectionInfoListener
-
-    @SuppressLint("MissingPermission")
-    suspend fun updateCurrentP2pGroupInfo(): WifiP2pGroup? {
-        Log.d("DevicesViewModel", "updateCurrentP2pGroupInfo() called.")
-        if (wifiP2pManager == null || p2pChannel == null) {
-            Log.w("DevicesViewModel", "updateP2pGroupInfo - P2PManager or Channel null."); _p2pGroupInfo.value = null; return null
-        }
+    fun registerP2pReceiver() {
+        if (p2pChannel == null) { Log.e("DevicesViewModel", "Cannot reg P2P receiver, channel null."); return }
         val context = getApplication<Application>().applicationContext
-        if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            Log.w("DevicesViewModel", "updateP2pGroupInfo - ACCESS_FINE_LOCATION missing."); _p2pGroupInfo.value = null; return null
-        }
-        try {
-            return kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
-                wifiP2pManager?.requestGroupInfo(p2pChannel, WifiP2pManager.GroupInfoListener { group ->
-                    Log.i("DevicesViewModel", "P2P_GROUP_INFO (update): Name: ${group?.networkName}, Owner: ${group?.owner?.deviceName}")
-                    _p2pGroupInfo.value = group
-                    if (continuation.isActive) { continuation.resume(group, null) }
-                })
-                continuation.invokeOnCancellation { Log.d("DevicesViewModel", "updateCurrentP2pGroupInfo coroutine cancelled.") }
-            }
-        } catch (e: SecurityException) { Log.e("DevicesViewModel", "SecEx updateCurrentP2pGroupInfo: ${e.message}", e); _p2pGroupInfo.value = null; return null }
-        catch (e: Exception) { Log.e("DevicesViewModel", "Ex updateCurrentP2pGroupInfo: ${e.message}", e); _p2pGroupInfo.value = null; return null }
+        if (p2pBroadcastReceiver == null) {
+            p2pBroadcastReceiver = WifiDirectBroadcastReceiver(wifiP2pManager, p2pChannel, this)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) { context.registerReceiver(p2pBroadcastReceiver, p2pIntentFilter, Context.RECEIVER_NOT_EXPORTED) }
+            else { context.registerReceiver(p2pBroadcastReceiver, p2pIntentFilter) }
+            Log.d("DevicesViewModel", "P2P BroadcastReceiver registered.")
+        } else { Log.d("DevicesViewModel", "P2P BroadcastReceiver already registered.") }
+    }
+    fun unregisterP2pReceiver() {
+        p2pDiscoveryTimeoutJob?.cancel()
+        if (p2pBroadcastReceiver != null) {
+            try { getApplication<Application>().applicationContext.unregisterReceiver(p2pBroadcastReceiver); Log.d("DevicesViewModel", "P2P BroadcastReceiver unregistered.") }
+            catch (e: IllegalArgumentException) { Log.w("DevicesViewModel", "Error unreg P2P receiver: ${e.message}") }
+            finally { p2pBroadcastReceiver = null }
+        } else { Log.d("DevicesViewModel", "P2P Receiver already null.")}
     }
 
-
-    @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
-    fun attemptDiscoveryOrRefreshGroup() {
-        viewModelScope.launch {
-            Log.i("DevicesViewModel", "attemptDiscoveryOrRefreshGroup called.")
-            val context = getApplication<Application>().applicationContext
-            if (wifiP2pManager == null || p2pChannel == null) { Log.e("DevicesViewModel", "attemptDiscOrRefresh - FAIL: P2PManager or Channel null."); permissionRequestStatus.value = "Error: P2P service not ready."; _isRefreshing.value = false; checkWifiDirectStatus(); return@launch }
-            if (!getWifiDirectPermissions().all { ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }) { Log.e("DevicesViewModel", "attemptDiscOrRefresh - FAIL: P2P Perms not granted."); permissionRequestStatus.value = "P2P Permissions missing."; _isRefreshing.value = false; return@launch }
-
-            _isRefreshing.value = true
-            val currentGroup = updateCurrentP2pGroupInfo()
-
-            if (currentGroup != null) {
-                Log.i("DevicesViewModel", "P2P_REFRESH_GROUP: Group '${currentGroup.networkName}' active. Populating members.")
-                permissionRequestStatus.value = "Displaying current group members..."
-                val members = mutableListOf<WifiP2pDevice>()
-                if (!currentGroup.isGroupOwner && currentGroup.owner != null) members.add(currentGroup.owner)
-                currentGroup.clientList?.let { members.addAll(it) }
-                onP2pPeersAvailable(members.distinctBy { it.deviceAddress }, fromGroupInfo = true)
-            } else {
-                Log.i("DevicesViewModel", "P2P_NEW_DISCOVERY: No active group. Attempting discovery.")
-                startP2pDiscovery()
-            }
+    fun onP2pPeersAvailable(peers: Collection<WifiP2pDevice>) {
+        wifiDirectPeersInternal.clear()
+        wifiDirectPeersInternal.addAll(peers)
+        updateDisplayableDeviceList()
+        if (peers.isEmpty()) {
+            permissionRequestStatus.value = "No Wi-Fi Direct peers found."
+        } else {
+            permissionRequestStatus.value = "${peers.size} Wi-Fi Direct peer(s) found."
         }
+        _isRefreshing.value = false
     }
 
     @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
@@ -259,17 +215,46 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         if (wifiP2pManager == null || p2pChannel == null) { Log.e("DevicesViewModel", "startP2pDisc - P2PManager/Channel null"); _isRefreshing.value = false; return }
         if (!getWifiDirectPermissions().all { ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }) { Log.e("DevicesViewModel", "startP2pDisc - Perms missing"); _isRefreshing.value = false; return }
 
-        _p2pGroupInfo.value?.let { Log.i("DevicesViewModel", "P2P_DISCOVERY: Group status before stop: ${it.networkName}") } ?: Log.i("DevicesViewModel", "P2P_DISCOVERY: No active group before stop.")
         _isRefreshing.value = true
         if (!isRetry) permissionRequestStatus.value = "Stopping previous P2P discovery..."
 
+        // Create a timeout job for stopping discovery
+        val stopTimeoutJob = viewModelScope.launch {
+            delay(5000) // 5 second timeout for stopping discovery
+            if (_isRefreshing.value && permissionRequestStatus.value.contains("Stopping previous P2P discovery")) {
+                Log.w("DevicesViewModel", "Timeout waiting for stopPeerDiscovery to complete. Proceeding with new discovery.")
+                initiateActualP2pDiscoveryAfterStop()
+            }
+        }
+
         try {
             wifiP2pManager?.stopPeerDiscovery(p2pChannel, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { Log.i("DevicesViewModel", "stopP2pDiscovery.onSuccess()"); if (!isRetry) permissionRequestStatus.value = "Preparing P2P discovery..."; initiateActualP2pDiscoveryAfterStop() }
-                override fun onFailure(reasonCode: Int) { val r = getFailureReasonString(reasonCode); Log.w("DevicesViewModel", "stopP2pDiscovery.onFailure - $r ($reasonCode)"); if (!isRetry) permissionRequestStatus.value = "Stop P2P warn ($r)"; initiateActualP2pDiscoveryAfterStop() }
+                override fun onSuccess() { 
+                    Log.i("DevicesViewModel", "stopP2pDiscovery.onSuccess()")
+                    stopTimeoutJob.cancel()
+                    if (!isRetry) permissionRequestStatus.value = "Preparing P2P discovery..."
+                    initiateActualP2pDiscoveryAfterStop() 
+                }
+                override fun onFailure(reasonCode: Int) { 
+                    val r = getFailureReasonString(reasonCode)
+                    Log.w("DevicesViewModel", "stopP2pDiscovery.onFailure - $r ($reasonCode)")
+                    stopTimeoutJob.cancel()
+                    if (!isRetry) permissionRequestStatus.value = "Stop P2P warn ($r)"
+                    initiateActualP2pDiscoveryAfterStop() 
+                }
             })
-        } catch (e: SecurityException) { Log.e("DevicesViewModel", "SecEx stopP2pDisc: ${e.message}", e); if (!isRetry) permissionRequestStatus.value = "PermErr stopP2PDisc"; initiateActualP2pDiscoveryAfterStop() }
-        catch (e: Exception) { Log.e("DevicesViewModel", "GenEx stopP2pDisc: ${e.message}", e); if (!isRetry) permissionRequestStatus.value = "Err stopP2PDisc"; initiateActualP2pDiscoveryAfterStop()}
+        } catch (e: SecurityException) { 
+            Log.e("DevicesViewModel", "SecEx stopP2pDisc: ${e.message}", e)
+            stopTimeoutJob.cancel()
+            if (!isRetry) permissionRequestStatus.value = "PermErr stopP2PDisc"
+            initiateActualP2pDiscoveryAfterStop() 
+        }
+        catch (e: Exception) { 
+            Log.e("DevicesViewModel", "GenEx stopP2pDisc: ${e.message}", e)
+            stopTimeoutJob.cancel()
+            if (!isRetry) permissionRequestStatus.value = "Err stopP2PDisc"
+            initiateActualP2pDiscoveryAfterStop()
+        }
     }
 
     @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
@@ -308,90 +293,53 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
 
 
-    fun registerP2pReceiver() {
-        if (p2pChannel == null) { Log.e("DevicesViewModel", "Cannot reg P2P receiver, channel null."); return }
-        val context = getApplication<Application>().applicationContext
-        if (p2pBroadcastReceiver == null) {
-            p2pBroadcastReceiver = WifiDirectBroadcastReceiver(wifiP2pManager, p2pChannel, this)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) { context.registerReceiver(p2pBroadcastReceiver, p2pIntentFilter, Context.RECEIVER_NOT_EXPORTED) }
-            else { context.registerReceiver(p2pBroadcastReceiver, p2pIntentFilter) }
-            Log.d("DevicesViewModel", "P2P BroadcastReceiver registered.")
-        } else { Log.d("DevicesViewModel", "P2P BroadcastReceiver already registered.") }
-    }
-    fun unregisterP2pReceiver() {
-        p2pDiscoveryTimeoutJob?.cancel()
-        if (p2pBroadcastReceiver != null) {
-            try { getApplication<Application>().applicationContext.unregisterReceiver(p2pBroadcastReceiver); Log.d("DevicesViewModel", "P2P BroadcastReceiver unregistered.") }
-            catch (e: IllegalArgumentException) { Log.w("DevicesViewModel", "Error unreg P2P receiver: ${e.message}") }
-            finally { p2pBroadcastReceiver = null }
-        } else { Log.d("DevicesViewModel", "P2P Receiver already null.")}
-    }
-
-    fun onP2pPeersAvailable(peers: Collection<WifiP2pDevice>, fromGroupInfo: Boolean = false) {
-        p2pDiscoveryTimeoutJob?.cancel()
-        viewModelScope.launch {
-            Log.d("DevicesViewModel", "onP2pPeersAvailable received ${peers.size} peers. FromGroupInfo: $fromGroupInfo")
-            if(fromGroupInfo){
-                wifiDirectPeersInternal.clear()
-                wifiDirectPeersInternal.addAll(peers)
-            } else {
-                wifiDirectPeersInternal.clear()
-                wifiDirectPeersInternal.addAll(peers)
-            }
-            updateDisplayableDeviceList()
-
-            val currentStatus = permissionRequestStatus.value
-            if (peers.isEmpty()) {
-                Log.d("DevicesViewModel", "No P2P peers reported by system.")
-                if (!fromGroupInfo && (currentStatus.startsWith("P2P Discovery started") || currentStatus.contains("Retrying") || currentStatus.startsWith("Refreshing current group members"))) {
-                    permissionRequestStatus.value = "No P2P devices found nearby."
-                } else if (fromGroupInfo && currentStatus.startsWith("Displaying current group members")) {
-                    permissionRequestStatus.value = "Current P2P group is empty (besides this device if owner)."
-                }
-            } else {
-                Log.i("DevicesViewModel", "P2P Peers list updated. Count: ${peers.size}")
-                if (!fromGroupInfo && (currentStatus.startsWith("P2P Discovery started") || currentStatus.startsWith("No P2P devices found") || currentStatus.contains("Retrying"))) {
-                    permissionRequestStatus.value = "${peers.size} P2P device(s) found."
-                } else if (fromGroupInfo && currentStatus.startsWith("Displaying current group members")) {
-                    permissionRequestStatus.value = "Group has ${peers.size} other member(s)."
-                }
-            }
-            _isRefreshing.value = false
-        }
-    }
-
     @SuppressLint("MissingPermission")
-    fun forceRequestP2pPeers() {
-        Log.i("DevicesViewModel", "forceRequestP2pPeers() called.")
-        if (wifiP2pManager == null || p2pChannel == null) { Log.e("DevicesViewModel", "forceReqP2pPeers - P2PManager/Channel null."); permissionRequestStatus.value = "P2P System not ready."; _isRefreshing.value = false; return }
-        val context = getApplication<Application>().applicationContext
-        if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) { Log.w("DevicesViewModel", "forceReqP2pPeers - Perm missing."); permissionRequestStatus.value = "Location perm needed."; _isRefreshing.value = false; return }
-        _isRefreshing.value = true
-        try {
-            wifiP2pManager?.requestPeers(p2pChannel) { peers ->
-                Log.i("DevicesViewModel", "forceReqP2pPeers - onPeersAvailable. Size: ${peers?.deviceList?.size ?: "null"}")
-                onP2pPeersAvailable(peers?.deviceList ?: emptyList(), fromGroupInfo = _p2pGroupInfo.value != null)
-            }
-            permissionRequestStatus.value = "Requesting current P2P peer list..."
-        } catch (e: SecurityException) { Log.e("DevicesViewModel", "SecEx forceReqP2pPeers: ${e.message}", e); permissionRequestStatus.value = "PermErr req P2P peers."; _isRefreshing.value = false; }
-    }
-
-    @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
     fun connectToP2pDevice(device: WifiP2pDevice) {
-        Log.i("DevicesViewModel", "connectToP2pDevice: ${device.deviceName}")
-        if (wifiP2pManager == null || p2pChannel == null) { Log.e("DevicesViewModel", "Cannot connect P2P: Manager/Channel null."); permissionRequestStatus.value = "P2P Connect Error: Service not ready."; return }
-        val context = getApplication<Application>().applicationContext
-        if (!getWifiDirectPermissions().all { ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }){
-            Log.e("DevicesViewModel", "connectToP2pDevice - Missing P2P permissions."); permissionRequestStatus.value = "P2P perm needed for connect."; return
+        Log.i("DevicesViewModel", "connectToP2pDevice: ${device.deviceName} (status: ${device.status})")
+        if (wifiP2pManager == null || p2pChannel == null) {
+            Log.e("DevicesViewModel", "Cannot connect P2P: Manager/Channel null.")
+            permissionRequestStatus.value = "P2P Connect Error: Service not ready."
+            return
         }
-        val config = WifiP2pConfig().apply { deviceAddress = device.deviceAddress }
-        Log.d("DevicesViewModel", "P2P Connecting to ${device.deviceAddress}")
+        val context = getApplication<Application>().applicationContext
+        if (!getWifiDirectPermissions().all { ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }) {
+            Log.e("DevicesViewModel", "connectToP2pDevice - Missing P2P permissions.")
+            permissionRequestStatus.value = "P2P perm needed for connect."
+            return
+        }
+
+        // Only connect if device is AVAILABLE
+        if (device.status != WifiP2pDevice.AVAILABLE) {
+            Log.w("DevicesViewModel", "Device ${device.deviceName} is not AVAILABLE (status: ${getDeviceP2pStatusString(device.status)}), skipping connect.")
+            permissionRequestStatus.value = "Device is not available for connection."
+            return
+        }
+
+        val config = WifiP2pConfig().apply {
+            deviceAddress = device.deviceAddress
+        }
+
         try {
             wifiP2pManager?.connect(p2pChannel, config, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { Log.i("DevicesViewModel", "P2P Connect INITIATION to ${device.deviceName} SUCCEEDED."); permissionRequestStatus.value = "P2P Connecting to ${device.deviceName}..." }
-                override fun onFailure(reasonCode: Int) { val r = getDetailedFailureReasonString(reasonCode); Log.e("DevicesViewModel", "P2P Connect INITIATION FAILED to ${device.deviceName}. Reason: $r ($reasonCode)"); permissionRequestStatus.value = "P2P Connect Failed: $r" }
+                override fun onSuccess() {
+                    Log.i("DevicesViewModel", "P2P Connect INITIATION to ${device.deviceName} SUCCEEDED.")
+                    permissionRequestStatus.value = "P2P Connecting to ${device.deviceName}..."
+                }
+                override fun onFailure(reasonCode: Int) {
+                    val r = getDetailedFailureReasonString(reasonCode)
+                    Log.e("DevicesViewModel", "P2P Connect INITIATION FAILED to ${device.deviceName}. Reason: $r ($reasonCode)")
+                    permissionRequestStatus.value = "P2P Connect Failed: $r"
+                    // Restart discovery on failure
+                    startP2pDiscovery()
+                }
             })
-        } catch (e: SecurityException) { Log.e("DevicesViewModel", "SecEx P2P connect: ${e.message}", e); permissionRequestStatus.value = "PermErr P2P connect." }
+        } catch (e: SecurityException) {
+            Log.e("DevicesViewModel", "SecEx P2P connect: ${e.message}", e)
+            permissionRequestStatus.value = "PermErr P2P connect."
+        } catch (e: Exception) {
+            Log.e("DevicesViewModel", "Unexpected error during P2P connect: ${e.message}", e)
+            permissionRequestStatus.value = "P2P Connect Error: ${e.message}"
+        }
     }
 
 
@@ -742,7 +690,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         } catch (e: SecurityException) { Log.w("DevicesViewModel", "SecEx stopP2PDisc during reset: ${e.message}", e)}
         catch (e: Exception) { Log.w("DevicesViewModel", "Ex stopP2PDisc during reset: ${e.message}")}
         unregisterP2pReceiver()
-        p2pChannel = null; wifiDirectPeersInternal.clear(); _p2pGroupInfo.value = null; updateDisplayableDeviceList()
+        p2pChannel = null; wifiDirectPeersInternal.clear(); updateDisplayableDeviceList()
         viewModelScope.launch {
             delay(500); initializeWifiP2p(isReset = true); delay(300)
             permissionRequestStatus.value = if (p2pChannel != null) "P2P Reset complete. Try discovery." else "P2P Reset failed to re-init channel."
@@ -985,7 +933,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun handleP2pConnectionInfo(info: WifiP2pInfo) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch {
             if (info.groupFormed) {
                 val peerDeviceName = if (info.isGroupOwner) "P2P Group Client" else info.groupOwnerAddress?.hostAddress ?: "P2P Group Owner"
                 if (info.isGroupOwner) {
@@ -1011,7 +959,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Disconnected (Group not formed)" }
                 // Add history if a sync was active
                 if (_isRefreshing.value) {
-                     _syncHistory.add(0, SyncHistoryEntry(folderName = "Active Sync", status = "Error", details = "P2P Group not formed or connection lost during active sync."))
+                    _syncHistory.add(0, SyncHistoryEntry(folderName = "Active Sync", status = "Error", details = "P2P Group not formed or connection lost during active sync."))
                 }
                 disconnectP2p()
             }
@@ -1491,10 +1439,15 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             }
             // --- Trigger media scan if file is an image or media ---
             stateMediaScanUri?.let { uri ->
-                val scanIntent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)
-                scanIntent.data = uri
-                getApplication<Application>().applicationContext.sendBroadcast(scanIntent)
-                Log.d("DevicesViewModel", "Media scan triggered for $uri")
+                val context = getApplication<Application>().applicationContext
+                android.media.MediaScannerConnection.scanFile(
+                    context,
+                    arrayOf(uri.toString()),
+                    null
+                ) { path, uri ->
+                    Log.d("DevicesViewModel", "Media scan completed for $uri at $path")
+                }
+                Log.d("DevicesViewModel", "Media scan triggered for $uri (MediaScannerConnection)")
                 stateMediaScanUri = null
             }
         } catch (e: IOException) {

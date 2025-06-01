@@ -110,7 +110,7 @@ fun DevicesScreen(
             viewModel.permissionRequestStatus.value = "Wi-Fi Direct permissions granted. Scanning..."
             try {
                 viewModel.registerP2pReceiver()
-                viewModel.attemptDiscoveryOrRefreshGroup()
+                viewModel.startP2pDiscovery()
             } catch (e: SecurityException) {
                 Log.e("DevicesScreen", "SecurityException (Wi-Fi Direct launch): ${e.message}", e)
                 viewModel.permissionRequestStatus.value = "Security exception: ${e.message}"
@@ -151,9 +151,6 @@ fun DevicesScreen(
                         try { viewModel.registerP2pReceiver() } catch (e: SecurityException) { Log.e("DevicesScreen", "SecEx P2P Reg: ${e.message}", e) }
                     } else { Log.w("DevicesScreen", "ON_RESUME: Wi-Fi Direct permissions MISSING.") }
 
-                    if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                        viewModel.refreshP2pGroupInfoOnResume()
-                    } else { Log.w("DevicesScreen", "ON_RESUME: Fine Location MISSING for P2P group info.") }
                     viewModel.updateBluetoothState()
                     if (viewModel.isBluetoothEnabled.value) {
                         // Check Bluetooth permissions before starting server
@@ -234,7 +231,7 @@ fun DevicesScreen(
                     if (perms.all { context.hasPermission(it) }) {
                         try {
                             viewModel.registerP2pReceiver()
-                            viewModel.attemptDiscoveryOrRefreshGroup()
+                            viewModel.startP2pDiscovery()
                         } catch (e: SecurityException) { Log.e("DevicesScreen", "SecEx P2P Scan: ${e.message}", e) }
                     } else {
                         wifiDirectPermissionsLauncher.launch(perms)
@@ -244,8 +241,7 @@ fun DevicesScreen(
             ) {
                 Icon(Icons.Filled.Search, contentDescription = "Scan Wi-Fi Direct", modifier = Modifier.size(ButtonDefaults.IconSize))
                 Spacer(Modifier.size(ButtonDefaults.IconSpacing))
-                val p2pGroupInfo: WifiP2pGroup? by viewModel.p2pGroupInfo.collectAsState() // Corrected
-                Text(if (p2pGroupInfo != null) "Refresh Group" else "Scan P2P")
+                Text("Scan P2P")
             }
 
             Button(
@@ -280,18 +276,6 @@ fun DevicesScreen(
                 Icon(Icons.Filled.Info, contentDescription = "Check P2P Status", modifier = Modifier.size(ButtonDefaults.IconSize))
                 Spacer(Modifier.size(ButtonDefaults.IconSpacing))
                 Text("P2P Status")
-            }
-            OutlinedButton(
-                onClick = {
-                    Log.d("DevicesScreen", "Force Request P2P Peers button clicked.")
-                    if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                        try { viewModel.forceRequestP2pPeers() } catch (e: SecurityException) { Log.e("DevicesScreen", "SecEx Force Peers: ${e.message}", e)}
-                    } else {
-                        wifiDirectPermissionsLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
-                    }
-                }, enabled = !isRefreshing && locationServicesOn // Also disable if location is off
-            ) {
-                Text("Force P2P Peers")
             }
         }
 
