@@ -131,6 +131,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
     private val outputStreamLock = Any()
 
+    // --- Add at the top of DevicesViewModel class ---
+    private var syncMetadataSentForSession = false
+
     init {
         Log.d("DevicesViewModel", "DevicesViewModel - INIT BLOCK - START")
         viewModelScope.launch {
@@ -834,6 +837,18 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         }
                         Log.d("DevicesViewModel", "Requesting ${filesToRequest.size} files for folder '${message.folderName}': $filesToRequest")
                         sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = message.folderName, requestedFilePaths = filesToRequest))
+
+                        // --- NEW: Also send our own file list back if we haven't already for this session ---
+                        if (!syncMetadataSentForSession) {
+                            syncMetadataSentForSession = true
+                            sendMessage(
+                                SyncMessage(
+                                    type = MessageType.SYNC_REQUEST_METADATA,
+                                    folderName = folderName,
+                                    fileMetadataList = localFilesToCompare
+                                )
+                            )
+                        }
                     }
                 }
                 MessageType.FILES_REQUESTED_BY_PEER -> {
@@ -858,6 +873,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     }
                     if (requestedPaths.isNullOrEmpty()){
                         sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = message.folderName))
+                        // --- Fix: Re-enable sync button if no files to send ---
+                        _isRefreshing.value = false
+                        permissionRequestStatus.value = "Sync complete (no files to send)."
                     } else {
                         Log.d("DevicesViewModel", "TODO: Need to track completion of ${requestedPaths.size} file sends before sending SYNC_COMPLETE.")
                     }
@@ -904,6 +922,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 MessageType.SYNC_COMPLETE -> {
                     Log.i("DevicesViewModel", "SYNC_COMPLETE received for folder: ${message.folderName}"); permissionRequestStatus.value = "Sync complete for '${message.folderName}'."; _isRefreshing.value = false
                     _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "Unknown", status = "Completed", details = "Sync successfully completed for folder."))
+                    // --- Reset syncMetadataSentForSession at the end of a sync ---
+                    syncMetadataSentForSession = false
                 }
                 MessageType.ERROR_MESSAGE -> {
                     Log.e("DevicesViewModel", "Received ERROR_MESSAGE: ${message.errorMessage}"); permissionRequestStatus.value = "Error from peer: ${message.errorMessage}"
@@ -1168,6 +1188,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         _activeSyncDestinationUris.value = currentMap.toMap()
         // -------------------------------------------------
 
+        // --- Reset syncMetadataSentForSession at the start of a sync ---
+        syncMetadataSentForSession = true
+
         viewModelScope.launch {
             permissionRequestStatus.value = "Preparing to sync folder: $folderNameForSyncMessage"
             _isRefreshing.value = true
@@ -1189,6 +1212,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             )
         }
     }
+
+    // --- Track outstanding file sends for two-way sync ---
+    private var pendingFileSends = mutableSetOf<String>()
 
     private suspend fun sendFile(baseFolderUri: Uri, relativePath: String, syncFolderName: String) {
         Log.d("DevicesViewModel", "sendFile: relativePath '$relativePath' from base URI '$baseFolderUri' for sync folder '$syncFolderName'")
@@ -1233,6 +1259,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             permissionRequestStatus.value = "Sending: $relativePath from $syncFolderName..."
         }
 
+        // --- Track this file as pending ---
+        pendingFileSends.add(relativePath)
+
         val bufferSize = 4096
         val buffer = ByteArray(bufferSize)
         var bytesRead: Int
@@ -1245,25 +1274,16 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 Log.e("DevicesViewModel", "Failed to open InputStream for ${targetDocumentFile.uri}")
                 sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = syncFolderName, errorMessage = "Failed to read file on sender: $relativePath"))
                 _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Error", details = "Failed to read file on sender: $relativePath."))
+                pendingFileSends.remove(relativePath)
                 return
             }
             while (fis.read(buffer).also { bytesRead = it } != -1 && currentCoroutineContext().isActive) {
                 if (bytesRead > 0) {
                     try {
                         val chunkToSend = buffer.copyOf(bytesRead)
-                        if (chunkToSend.size != bytesRead) {
-                            Log.w("DevicesViewModel", "Chunk size mismatch: chunkToSend.size=${chunkToSend.size}, bytesRead=$bytesRead")
-                        }
-                        Log.d("DevicesViewModel", "Preparing to send chunk $chunkCount: bytesRead=$bytesRead, chunkToSend.size=${chunkToSend.size}, first 8 bytes: ${chunkToSend.take(8).joinToString(" ") { String.format("%02x", it) }}, last 8 bytes: ${chunkToSend.takeLast(8).joinToString(" ") { String.format("%02x", it) }}")
-                        try {
-                            sendMessage(SyncMessage(MessageType.FILE_CHUNK, folderName = syncFolderName, fileChunkData = chunkToSend))
-                        } catch (e: Exception) {
-                            Log.e("DevicesViewModel", "Exception sending chunk $chunkCount: ${e.message}", e)
-                            throw e
-                        }
+                        sendMessage(SyncMessage(MessageType.FILE_CHUNK, folderName = syncFolderName, fileChunkData = chunkToSend))
                         totalBytesSent += bytesRead
                         chunkCount++
-                        Log.d("DevicesViewModel", "Sent chunk $chunkCount of size $bytesRead for $relativePath (total sent: $totalBytesSent)")
                     } catch (e: Exception) {
                         Log.e("DevicesViewModel", "Exception preparing chunk $chunkCount: bytesRead=$bytesRead, buffer.size=${buffer.size}", e)
                         throw e
@@ -1279,6 +1299,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         if (!currentCoroutineContext().isActive) {
             Log.w("DevicesViewModel", "File sending for $relativePath was cancelled during/after read loop.")
             _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Cancelled", details = "File sending for $relativePath was cancelled."))
+            pendingFileSends.remove(relativePath)
             return
         }
         Log.i("DevicesViewModel", "Finished sending chunks for $relativePath from $syncFolderName, total $totalBytesSent bytes.")
@@ -1294,6 +1315,15 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         } else {
             Log.w("DevicesViewModel", "File sending for $relativePath was cancelled, FILE_TRANSFER_END not sent.")
              _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Cancelled", details = "File sending for $relativePath cancelled, FILE_TRANSFER_END not sent."))
+        }
+
+        // --- Remove from pending and re-enable sync button if done ---
+        pendingFileSends.remove(relativePath)
+        if (pendingFileSends.isEmpty()) {
+            withContext(Dispatchers.Main) {
+                _isRefreshing.value = false
+                permissionRequestStatus.value = "Sync complete for '$syncFolderName'."
+            }
         }
     }
 
