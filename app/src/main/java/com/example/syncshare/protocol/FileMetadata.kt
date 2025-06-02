@@ -7,5 +7,5 @@ data class FileMetadata(
     val name: String,         // Just the file name, e.g., "img1.jpg"
     val size: Long,
     val lastModified: Long,
-    val hash: String // New: hash of file contents for robust sync
+    val hash: String // Hash of file contents for robust sync
 ) : Serializable // Implement Serializable for easy sending over ObjectOutputStream

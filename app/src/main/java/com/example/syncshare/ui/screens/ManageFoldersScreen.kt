@@ -69,18 +69,16 @@ fun ManageFoldersScreen(
             Text("Selected Folders", style = MaterialTheme.typography.headlineSmall)
             Spacer(modifier = Modifier.height(16.dp))
 
-            if (selectedFolders.isEmpty()) { // This should be fine for a List<Uri>
+            if (selectedFolders.isEmpty()) {
                 Text("No folders selected. Tap '+' to add a folder for synchronization.")
             } else {
                 LazyColumn(modifier = Modifier.fillMaxWidth()) {
-                    // Use the named parameter 'items' to guide overload resolution
                     items(
-                        items = selectedFolders, // Pass the list here
-                        key = { folderUri -> folderUri.toString() } // folderUri should be Uri
-                    ) { folderItemUri: Uri -> // Explicitly type folderUri as Uri
-                        // Now folderUri inside this lambda is correctly typed as Uri
+                        items = selectedFolders,
+                        key = { folderUri -> folderUri.toString() }
+                    ) { folderItemUri: Uri ->
                         FolderItem(
-                            uri = folderItemUri, // Pass Uri
+                            uri = folderItemUri,
                             onRemoveClick = { viewModel.removeFolder(folderItemUri) }
                         )
                         Divider()
@@ -101,8 +99,7 @@ fun FolderItem(uri: Uri, onRemoveClick: () -> Unit) { // uri is android.net.Uri
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
-        // Simplify the text extraction for now to see if substringAfterLast is the main culprit
-        val folderName = uri.lastPathSegment // This can be null
+        val folderName = uri.lastPathSegment
         val displayText = if (folderName != null) {
             folderName.substringAfterLast(':', folderName) // If ':' not found, use folderName itself
         } else {

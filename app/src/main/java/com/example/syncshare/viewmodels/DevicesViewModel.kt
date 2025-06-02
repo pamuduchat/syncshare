@@ -16,12 +16,10 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pDevice
-import android.net.wifi.p2p.WifiP2pGroup
-import android.net.wifi.p2p.WifiP2pInfo 
+import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Looper
-import android.provider.DocumentsContract
 import android.util.Log
 import androidx.annotation.RequiresPermission
 import androidx.compose.runtime.mutableStateListOf
@@ -30,7 +28,7 @@ import androidx.core.app.ActivityCompat
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.syncshare.data.SyncHistoryEntry // Added for history
+import com.example.syncshare.data.SyncHistoryEntry
 import com.example.syncshare.features.WifiDirectBroadcastReceiver
 import com.example.syncshare.protocol.FileMetadata
 import com.example.syncshare.protocol.FileTransferInfo
@@ -56,10 +54,8 @@ import java.io.ObjectInputStream
 import java.io.ObjectOutputStream
 import java.net.ServerSocket
 import java.net.Socket
-import java.util.UUID 
 import android.webkit.MimeTypeMap
 import java.security.MessageDigest
-import com.example.syncshare.viewmodels.ManageFoldersViewModel
 import android.content.SharedPreferences
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
@@ -108,8 +104,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     private var p2pClientSocket: java.net.Socket? = null
     private val _p2pConnectionStatus = MutableStateFlow<String>("Disconnected")
     val p2pConnectionStatus: StateFlow<String> = _p2pConnectionStatus
-    private var p2pServerJob: kotlinx.coroutines.Job? = null 
-    private var p2pClientConnectJob: kotlinx.coroutines.Job? = null
+    private var p2pServerJob: kotlinx.coroutines.Job? = null
 
     private val _activeSyncDestinationUris = MutableStateFlow<Map<String, Uri>>(emptyMap())
     val activeSyncDestinationUrisState: StateFlow<Map<String, Uri>> = _activeSyncDestinationUris
@@ -126,7 +121,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     private val wifiDirectPeersInternal = mutableStateListOf<WifiP2pDevice>()
     private val bluetoothDevicesInternal = mutableStateListOf<BluetoothDevice>()
 
-    private var activeSocket: java.net.Socket? = null 
     private var objectOutputStream: ObjectOutputStream? = null
     private var objectInputStream: ObjectInputStream? = null
     private var communicationJob: Job? = null
@@ -168,7 +162,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 val newPath = conflict.relativePath + "_remote_${System.currentTimeMillis()}"
                 // The receiver will need to handle this rename on receipt
                 sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = conflict.folderName, requestedFilePaths = listOf(conflict.relativePath)))
-                // You may need to track this mapping for renaming on receive
             }
             ConflictResolutionOption.SKIP -> {
                 // Do nothing
@@ -913,7 +906,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                                         // Conflict detected: both exist, but content differs
                                         conflicts.add(FileConflict(folderName ?: "", remotePath, localMeta, remoteMeta))
                                     }
-                                    // If sizes differ but hash is same, rare, but treat as conflict
+
                                 }
                                 // If sizes are the same, treat as identical, skip (even if hash/lastModified differ)
                             }
@@ -1737,8 +1730,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         _p2pConnectionStatus.value = "Disconnected"
         _isRefreshing.value = false
         permissionRequestStatus.value = "Idle. Tap a scan button."
-        // Optionally clear sync history if you want a full UI reset:
-        // _syncHistory.clear()
     }
 
     // --- Reference to ManageFoldersViewModel for folder registration ---

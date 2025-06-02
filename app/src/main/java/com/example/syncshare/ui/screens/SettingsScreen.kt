@@ -16,7 +16,7 @@ import com.example.syncshare.viewmodels.DevicesViewModel
 @Composable
 fun SettingsScreen(
     modifier: Modifier = Modifier,
-    devicesViewModel: DevicesViewModel? = null // Pass if you want diagnostics
+    devicesViewModel: DevicesViewModel? = null
 ) {
     val context = LocalContext.current
     var autoSync by remember { mutableStateOf(false) }

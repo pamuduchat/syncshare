@@ -22,7 +22,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.example.syncshare.navigation.Screen
 import com.example.syncshare.navigation.bottomNavItems
-import com.example.syncshare.ui.screens.* // Import your screens
+import com.example.syncshare.ui.screens.*
 import com.example.syncshare.ui.theme.SyncshareTheme
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.syncshare.viewmodels.DevicesViewModel
@@ -30,7 +30,6 @@ import com.example.syncshare.viewmodels.ManageFoldersViewModel
 import android.content.Intent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material3.AlertDialog
@@ -50,8 +49,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import com.example.syncshare.viewmodels.DevicesViewModel.ConflictResolutionOption
-import com.example.syncshare.viewmodels.DevicesViewModel.FileConflict
-import androidx.lifecycle.ViewModelProvider
+
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.example.syncshare.utils.getWifiDirectPermissions

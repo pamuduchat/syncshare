@@ -11,7 +11,6 @@ import androidx.activity.compose.ManagedActivityResultLauncher
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.core.content.ContextCompat
 
 // Single permission
@@ -71,7 +70,7 @@ fun getWifiDirectPermissions(): Array<String> {
 }
 
 // Storage permissions (pre-Scoped Storage, mostly for READ to list files)
-// For folder selection, we'll use SAF which doesn't need these direct permissions
+// For folder selection using SAF
 fun getOldStoragePermissions(): Array<String> {
     return if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) { // Android 9 and below
         arrayOf(
@@ -79,7 +78,7 @@ fun getOldStoragePermissions(): Array<String> {
             Manifest.permission.WRITE_EXTERNAL_STORAGE
         )
     } else {
-        arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE) // READ might still be useful
+        arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
     }
 }
 fun isLocationEnabled(context: Context): Boolean {
@@ -120,7 +119,6 @@ fun getBluetoothPermissions(): Array<String> {
             Manifest.permission.BLUETOOTH_SCAN,
             Manifest.permission.BLUETOOTH_CONNECT,
             Manifest.permission.BLUETOOTH_ADVERTISE
-            // Optionally add Manifest.permission.ACCESS_FINE_LOCATION if needed for more robust scanning
         )
     } else {
         arrayOf(
