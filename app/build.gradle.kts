@@ -80,5 +80,6 @@ dependencies {
 
     implementation(libs.accompanist.swiperefresh)
 
+    implementation(libs.gson)
 
 }

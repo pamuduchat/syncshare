@@ -1,16 +1,12 @@
 package com.example.syncshare.ui.screens
 
-import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.wifi.p2p.WifiP2pDevice
-import android.net.wifi.p2p.WifiP2pGroup
 import android.provider.Settings
 import android.util.Log
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -25,7 +21,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.lifecycle.compose.LocalLifecycleOwner // Corrected Import
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
 import androidx.lifecycle.Lifecycle
@@ -40,8 +36,7 @@ import com.example.syncshare.utils.isLocationEnabled
 import com.example.syncshare.utils.rememberPermissionsLauncher
 import com.example.syncshare.viewmodels.DevicesViewModel
 import kotlinx.coroutines.launch
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.result.ActivityResultLauncher
+
 
 @SuppressLint("MissingPermission")
 @Composable
@@ -65,40 +60,6 @@ fun DevicesScreen(
         mutableStateOf(isLocationEnabled(context))
     }
 
-    val pendingFolder = viewModel.pendingFolderMapping.value
-    val folderPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree(),
-        onResult = { uri: android.net.Uri? ->
-            if (uri != null && pendingFolder != null) {
-                context.contentResolver.takePersistableUriPermission(
-                    uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                )
-                viewModel.setDestinationUriForSync(pendingFolder, uri)
-                viewModel.pendingFolderMapping.value = null
-                viewModel.retryPendingSyncIfNeeded()
-            }
-        }
-    )
-
-    if (pendingFolder != null) {
-        AlertDialog(
-            onDismissRequest = { viewModel.pendingFolderMapping.value = null },
-            title = { Text("Select Destination Folder") },
-            text = { Text("Please select a destination folder for incoming sync: '$pendingFolder'") },
-            confirmButton = {
-                Button(onClick = { folderPickerLauncher.launch(null) }) {
-                    Text("Choose Folder")
-                }
-            },
-            dismissButton = {
-                OutlinedButton(onClick = { viewModel.pendingFolderMapping.value = null }) {
-                    Text("Cancel")
-                }
-            }
-        )
-    }
-
     val wifiDirectPermissionsLauncher = rememberPermissionsLauncher { permissionsResult ->
         var allGranted = true
         permissionsResult.forEach { (perm, granted) ->
@@ -110,7 +71,7 @@ fun DevicesScreen(
             viewModel.permissionRequestStatus.value = "Wi-Fi Direct permissions granted. Scanning..."
             try {
                 viewModel.registerP2pReceiver()
-                viewModel.attemptDiscoveryOrRefreshGroup()
+                viewModel.startP2pDiscovery()
             } catch (e: SecurityException) {
                 Log.e("DevicesScreen", "SecurityException (Wi-Fi Direct launch): ${e.message}", e)
                 viewModel.permissionRequestStatus.value = "Security exception: ${e.message}"
@@ -151,9 +112,6 @@ fun DevicesScreen(
                         try { viewModel.registerP2pReceiver() } catch (e: SecurityException) { Log.e("DevicesScreen", "SecEx P2P Reg: ${e.message}", e) }
                     } else { Log.w("DevicesScreen", "ON_RESUME: Wi-Fi Direct permissions MISSING.") }
 
-                    if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                        viewModel.refreshP2pGroupInfoOnResume()
-                    } else { Log.w("DevicesScreen", "ON_RESUME: Fine Location MISSING for P2P group info.") }
                     viewModel.updateBluetoothState()
                     if (viewModel.isBluetoothEnabled.value) {
                         // Check Bluetooth permissions before starting server
@@ -163,8 +121,6 @@ fun DevicesScreen(
                             viewModel.prepareBluetoothService() // This will start the BT server
                         } else {
                             Log.w("DevicesScreen", "ON_RESUME: Bluetooth permissions MISSING. BT Server not started.")
-                            // Optionally, you could trigger bluetoothPermissionsLauncher.launch(btPerms) here
-                            // if you want to proactively ask for permissions on resume.
                         }
                     } else {
                         Log.d("DevicesScreen", "ON_RESUME: Bluetooth is not enabled.")
@@ -234,7 +190,7 @@ fun DevicesScreen(
                     if (perms.all { context.hasPermission(it) }) {
                         try {
                             viewModel.registerP2pReceiver()
-                            viewModel.attemptDiscoveryOrRefreshGroup()
+                            viewModel.startP2pDiscovery()
                         } catch (e: SecurityException) { Log.e("DevicesScreen", "SecEx P2P Scan: ${e.message}", e) }
                     } else {
                         wifiDirectPermissionsLauncher.launch(perms)
@@ -244,8 +200,7 @@ fun DevicesScreen(
             ) {
                 Icon(Icons.Filled.Search, contentDescription = "Scan Wi-Fi Direct", modifier = Modifier.size(ButtonDefaults.IconSize))
                 Spacer(Modifier.size(ButtonDefaults.IconSpacing))
-                val p2pGroupInfo: WifiP2pGroup? by viewModel.p2pGroupInfo.collectAsState() // Corrected
-                Text(if (p2pGroupInfo != null) "Refresh Group" else "Scan P2P")
+                Text("Scan P2P")
             }
 
             Button(
@@ -281,17 +236,13 @@ fun DevicesScreen(
                 Spacer(Modifier.size(ButtonDefaults.IconSpacing))
                 Text("P2P Status")
             }
-            OutlinedButton(
-                onClick = {
-                    Log.d("DevicesScreen", "Force Request P2P Peers button clicked.")
-                    if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                        try { viewModel.forceRequestP2pPeers() } catch (e: SecurityException) { Log.e("DevicesScreen", "SecEx Force Peers: ${e.message}", e)}
-                    } else {
-                        wifiDirectPermissionsLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
-                    }
-                }, enabled = !isRefreshing && locationServicesOn // Also disable if location is off
-            ) {
-                Text("Force P2P Peers")
+        }
+
+        // --- New Row: P2P Disconnect Button ---
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+            OutlinedButton(onClick = { viewModel.fullResetP2pConnection() }, enabled = !isRefreshing) {
+                Text("Disconnect P2P")
             }
         }
 
@@ -352,7 +303,7 @@ fun DevicesScreen(
                             viewModel.permissionRequestStatus.value = "Error initiating connection."
                         }
                     })
-                    HorizontalDivider() // Corrected
+                    HorizontalDivider()
                 }
             }
         }
@@ -370,10 +321,9 @@ fun UnifiedDeviceItem(displayableDevice: DisplayableDevice, onClick: () -> Unit)
         verticalAlignment = Alignment.CenterVertically
     ) {
         val icon = when(displayableDevice.technology) {
-            DeviceTechnology.WIFI_DIRECT -> Icons.Filled.Search // Consider Icons.Filled.Wifi
+            DeviceTechnology.WIFI_DIRECT -> Icons.Filled.Search
             DeviceTechnology.BLUETOOTH_CLASSIC -> Icons.Filled.Bluetooth
             DeviceTechnology.UNKNOWN -> Icons.Filled.Info
-            // Add 'else -> Icons.Default.Help' or similar for future-proofing
         }
         Icon(icon, contentDescription = displayableDevice.technology.name, modifier = Modifier.size(24.dp))
         Spacer(modifier = Modifier.width(12.dp))

@@ -16,12 +16,10 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pDevice
-import android.net.wifi.p2p.WifiP2pGroup
-import android.net.wifi.p2p.WifiP2pInfo 
+import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Looper
-import android.provider.DocumentsContract
 import android.util.Log
 import androidx.annotation.RequiresPermission
 import androidx.compose.runtime.mutableStateListOf
@@ -30,7 +28,7 @@ import androidx.core.app.ActivityCompat
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.syncshare.data.SyncHistoryEntry // Added for history
+import com.example.syncshare.data.SyncHistoryEntry
 import com.example.syncshare.features.WifiDirectBroadcastReceiver
 import com.example.syncshare.protocol.FileMetadata
 import com.example.syncshare.protocol.FileTransferInfo
@@ -56,8 +54,11 @@ import java.io.ObjectInputStream
 import java.io.ObjectOutputStream
 import java.net.ServerSocket
 import java.net.Socket
-import java.util.UUID 
 import android.webkit.MimeTypeMap
+import java.security.MessageDigest
+import android.content.SharedPreferences
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 
 enum class CommunicationTechnology { BLUETOOTH, P2P }
 
@@ -79,8 +80,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
     private var p2pDiscoveryRetryCount = 0
     private val MAX_P2P_DISCOVERY_RETRIES = 3
-    private val _p2pGroupInfo = MutableStateFlow<WifiP2pGroup?>(null)
-    val p2pGroupInfo: StateFlow<WifiP2pGroup?> = _p2pGroupInfo
     private var p2pDiscoveryTimeoutJob: Job? = null
     private val P2P_DISCOVERY_TIMEOUT_MS = 20000L
 
@@ -105,8 +104,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     private var p2pClientSocket: java.net.Socket? = null
     private val _p2pConnectionStatus = MutableStateFlow<String>("Disconnected")
     val p2pConnectionStatus: StateFlow<String> = _p2pConnectionStatus
-    private var p2pServerJob: kotlinx.coroutines.Job? = null 
-    private var p2pClientConnectJob: kotlinx.coroutines.Job? = null
+    private var p2pServerJob: kotlinx.coroutines.Job? = null
 
     private val _activeSyncDestinationUris = MutableStateFlow<Map<String, Uri>>(emptyMap())
     val activeSyncDestinationUrisState: StateFlow<Map<String, Uri>> = _activeSyncDestinationUris
@@ -123,7 +121,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     private val wifiDirectPeersInternal = mutableStateListOf<WifiP2pDevice>()
     private val bluetoothDevicesInternal = mutableStateListOf<BluetoothDevice>()
 
-    private var activeSocket: java.net.Socket? = null 
     private var objectOutputStream: ObjectOutputStream? = null
     private var objectInputStream: ObjectInputStream? = null
     private var communicationJob: Job? = null
@@ -131,8 +128,75 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
     private val outputStreamLock = Any()
 
+    // --- Add at the top of DevicesViewModel class ---
+    private var syncMetadataSentForSession = false
+
+    // --- Conflict data class and state ---
+    data class FileConflict(
+        val folderName: String,
+        val relativePath: String,
+        val local: FileMetadata?,
+        val remote: FileMetadata?
+    )
+    private val _fileConflicts = MutableStateFlow<List<FileConflict>>(emptyList())
+    val fileConflicts: StateFlow<List<FileConflict>> = _fileConflicts
+
+    // --- Conflict resolution options ---
+    enum class ConflictResolutionOption { KEEP_LOCAL, USE_REMOTE, KEEP_BOTH, SKIP }
+
+    // --- Expose a function to resolve a conflict ---
+    fun resolveFileConflict(conflict: FileConflict, option: ConflictResolutionOption) {
+        // Remove the conflict from the list
+        val updated = _fileConflicts.value.toMutableList().apply { remove(conflict) }
+        _fileConflicts.value = updated
+        when (option) {
+            ConflictResolutionOption.KEEP_LOCAL -> {
+                // Do nothing, keep local file
+            }
+            ConflictResolutionOption.USE_REMOTE -> {
+                // Request the remote file
+                sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = conflict.folderName, requestedFilePaths = listOf(conflict.relativePath)))
+            }
+            ConflictResolutionOption.KEEP_BOTH -> {
+                // Request remote file, but with a new name (e.g., append _remote or timestamp)
+                val newPath = conflict.relativePath + "_remote_${System.currentTimeMillis()}"
+                // The receiver will need to handle this rename on receipt
+                sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = conflict.folderName, requestedFilePaths = listOf(conflict.relativePath)))
+            }
+            ConflictResolutionOption.SKIP -> {
+                // Do nothing
+            }
+        }
+        // If all conflicts resolved, resume sync if needed
+        if (_fileConflicts.value.isEmpty()) {
+            _isRefreshing.value = false
+            permissionRequestStatus.value = "All conflicts resolved. Sync can continue."
+        }
+    }
+
+    private val prefs: SharedPreferences = application.getSharedPreferences("syncshare_prefs", Context.MODE_PRIVATE)
+    private val KEY_HISTORY = "sync_history"
+    private val gson = Gson()
+
+    fun persistHistory() {
+        val json = gson.toJson(_syncHistory)
+        prefs.edit().putString(KEY_HISTORY, json).apply()
+    }
+    private fun loadHistory() {
+        val json = prefs.getString(KEY_HISTORY, null)
+        if (json != null) {
+            val type = object : TypeToken<MutableList<SyncHistoryEntry>>() {}.type
+            val list: MutableList<SyncHistoryEntry> = gson.fromJson(json, type) ?: mutableListOf()
+            _syncHistory.clear()
+            _syncHistory.addAll(list)
+            persistHistory()
+        }
+    }
+
     init {
         Log.d("DevicesViewModel", "DevicesViewModel - INIT BLOCK - START")
+        fullResetP2pConnection() // Always start with a clean P2P state
+        loadHistory()
         viewModelScope.launch {
             initializeWifiP2p()
             updateBluetoothState()
@@ -159,7 +223,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     Log.e("DevicesViewModel", "************ P2P CHANNEL DISCONNECTED ************")
                     this@DevicesViewModel.p2pChannel = null
                     permissionRequestStatus.value = "P2P Channel Lost! Reset or restart app."
-                    _isRefreshing.value = false; wifiDirectPeersInternal.clear(); _p2pGroupInfo.value = null; updateDisplayableDeviceList()
+                    _isRefreshing.value = false; wifiDirectPeersInternal.clear(); updateDisplayableDeviceList()
                     p2pDiscoveryTimeoutJob?.cancel()
                 }
             })
@@ -167,84 +231,40 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
         if (p2pChannel == null) {  Log.e("DevicesViewModel", "P2P_INIT_FAIL: Channel is null after initialize."); permissionRequestStatus.value = "Error: P2P Channel failed to init.";  return }
         Log.d("DevicesViewModel", "P2P_INIT: Channel Initialized: $p2pChannel")
-        refreshP2pGroupInfoOnResume()
         if (isReset) {
             viewModelScope.launch { delay(300); registerP2pReceiver() }
         }
     }
 
-    fun refreshP2pGroupInfoOnResume() {
-        viewModelScope.launch {
-            Log.d("DevicesViewModel", "refreshP2pGroupInfoOnResume launching coroutine to update group info.")
-            updateCurrentP2pGroupInfo()
-        }
-    }
-    fun onP2pConnectionChanged() {
-        viewModelScope.launch {
-            Log.d("DevicesViewModel", "onP2pConnectionChanged() - will refresh group info and request connection info.")
-            updateCurrentP2pGroupInfo()
-            if (wifiP2pManager != null && p2pChannel != null) {
-                wifiP2pManager?.requestConnectionInfo(p2pChannel, getP2pConnectionInfoListener())
-            } else {
-                Log.w("DevicesViewModel", "Cannot request P2P connection info onP2pConnectionChanged: manager or channel is null.")
-            }
-        }
-    }
-
-    private val p2pConnectionInfoListener = WifiP2pManager.ConnectionInfoListener { info ->
-        Log.d("DevicesViewModel", "P2P Connection Info Available. Group formed: ${info.groupFormed}, Is owner: ${info.isGroupOwner}, Owner IP: ${info.groupOwnerAddress?.hostAddress}")
-        handleP2pConnectionInfo(info)
-    }
-
-    fun getP2pConnectionInfoListener(): WifiP2pManager.ConnectionInfoListener = p2pConnectionInfoListener
-
-    @SuppressLint("MissingPermission")
-    suspend fun updateCurrentP2pGroupInfo(): WifiP2pGroup? {
-        Log.d("DevicesViewModel", "updateCurrentP2pGroupInfo() called.")
-        if (wifiP2pManager == null || p2pChannel == null) {
-            Log.w("DevicesViewModel", "updateP2pGroupInfo - P2PManager or Channel null."); _p2pGroupInfo.value = null; return null
-        }
+    fun registerP2pReceiver() {
+        if (p2pChannel == null) { Log.e("DevicesViewModel", "Cannot reg P2P receiver, channel null."); return }
         val context = getApplication<Application>().applicationContext
-        if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            Log.w("DevicesViewModel", "updateP2pGroupInfo - ACCESS_FINE_LOCATION missing."); _p2pGroupInfo.value = null; return null
-        }
-        try {
-            return kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
-                wifiP2pManager?.requestGroupInfo(p2pChannel, WifiP2pManager.GroupInfoListener { group ->
-                    Log.i("DevicesViewModel", "P2P_GROUP_INFO (update): Name: ${group?.networkName}, Owner: ${group?.owner?.deviceName}")
-                    _p2pGroupInfo.value = group
-                    if (continuation.isActive) { continuation.resume(group, null) }
-                })
-                continuation.invokeOnCancellation { Log.d("DevicesViewModel", "updateCurrentP2pGroupInfo coroutine cancelled.") }
-            }
-        } catch (e: SecurityException) { Log.e("DevicesViewModel", "SecEx updateCurrentP2pGroupInfo: ${e.message}", e); _p2pGroupInfo.value = null; return null }
-        catch (e: Exception) { Log.e("DevicesViewModel", "Ex updateCurrentP2pGroupInfo: ${e.message}", e); _p2pGroupInfo.value = null; return null }
+        if (p2pBroadcastReceiver == null) {
+            p2pBroadcastReceiver = WifiDirectBroadcastReceiver(wifiP2pManager, p2pChannel, this)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) { context.registerReceiver(p2pBroadcastReceiver, p2pIntentFilter, Context.RECEIVER_NOT_EXPORTED) }
+            else { context.registerReceiver(p2pBroadcastReceiver, p2pIntentFilter) }
+            Log.d("DevicesViewModel", "P2P BroadcastReceiver registered.")
+        } else { Log.d("DevicesViewModel", "P2P BroadcastReceiver already registered.") }
+    }
+    fun unregisterP2pReceiver() {
+        p2pDiscoveryTimeoutJob?.cancel()
+        if (p2pBroadcastReceiver != null) {
+            try { getApplication<Application>().applicationContext.unregisterReceiver(p2pBroadcastReceiver); Log.d("DevicesViewModel", "P2P BroadcastReceiver unregistered.") }
+            catch (e: IllegalArgumentException) { Log.w("DevicesViewModel", "Error unreg P2P receiver: ${e.message}") }
+            finally { p2pBroadcastReceiver = null }
+        } else { Log.d("DevicesViewModel", "P2P Receiver already null.")}
     }
 
-
-    @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
-    fun attemptDiscoveryOrRefreshGroup() {
-        viewModelScope.launch {
-            Log.i("DevicesViewModel", "attemptDiscoveryOrRefreshGroup called.")
-            val context = getApplication<Application>().applicationContext
-            if (wifiP2pManager == null || p2pChannel == null) { Log.e("DevicesViewModel", "attemptDiscOrRefresh - FAIL: P2PManager or Channel null."); permissionRequestStatus.value = "Error: P2P service not ready."; _isRefreshing.value = false; checkWifiDirectStatus(); return@launch }
-            if (!getWifiDirectPermissions().all { ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }) { Log.e("DevicesViewModel", "attemptDiscOrRefresh - FAIL: P2P Perms not granted."); permissionRequestStatus.value = "P2P Permissions missing."; _isRefreshing.value = false; return@launch }
-
-            _isRefreshing.value = true
-            val currentGroup = updateCurrentP2pGroupInfo()
-
-            if (currentGroup != null) {
-                Log.i("DevicesViewModel", "P2P_REFRESH_GROUP: Group '${currentGroup.networkName}' active. Populating members.")
-                permissionRequestStatus.value = "Displaying current group members..."
-                val members = mutableListOf<WifiP2pDevice>()
-                if (!currentGroup.isGroupOwner && currentGroup.owner != null) members.add(currentGroup.owner)
-                currentGroup.clientList?.let { members.addAll(it) }
-                onP2pPeersAvailable(members.distinctBy { it.deviceAddress }, fromGroupInfo = true)
-            } else {
-                Log.i("DevicesViewModel", "P2P_NEW_DISCOVERY: No active group. Attempting discovery.")
-                startP2pDiscovery()
-            }
+    fun onP2pPeersAvailable(peers: Collection<WifiP2pDevice>) {
+        wifiDirectPeersInternal.clear()
+        wifiDirectPeersInternal.addAll(peers)
+        updateDisplayableDeviceList()
+        if (peers.isEmpty()) {
+            permissionRequestStatus.value = "No Wi-Fi Direct peers found."
+        } else {
+            permissionRequestStatus.value = "${peers.size} Wi-Fi Direct peer(s) found."
         }
+        _isRefreshing.value = false
     }
 
     @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
@@ -259,17 +279,46 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         if (wifiP2pManager == null || p2pChannel == null) { Log.e("DevicesViewModel", "startP2pDisc - P2PManager/Channel null"); _isRefreshing.value = false; return }
         if (!getWifiDirectPermissions().all { ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }) { Log.e("DevicesViewModel", "startP2pDisc - Perms missing"); _isRefreshing.value = false; return }
 
-        _p2pGroupInfo.value?.let { Log.i("DevicesViewModel", "P2P_DISCOVERY: Group status before stop: ${it.networkName}") } ?: Log.i("DevicesViewModel", "P2P_DISCOVERY: No active group before stop.")
         _isRefreshing.value = true
         if (!isRetry) permissionRequestStatus.value = "Stopping previous P2P discovery..."
 
+        // Create a timeout job for stopping discovery
+        val stopTimeoutJob = viewModelScope.launch {
+            delay(5000) // 5 second timeout for stopping discovery
+            if (_isRefreshing.value && permissionRequestStatus.value.contains("Stopping previous P2P discovery")) {
+                Log.w("DevicesViewModel", "Timeout waiting for stopPeerDiscovery to complete. Proceeding with new discovery.")
+                initiateActualP2pDiscoveryAfterStop()
+            }
+        }
+
         try {
             wifiP2pManager?.stopPeerDiscovery(p2pChannel, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { Log.i("DevicesViewModel", "stopP2pDiscovery.onSuccess()"); if (!isRetry) permissionRequestStatus.value = "Preparing P2P discovery..."; initiateActualP2pDiscoveryAfterStop() }
-                override fun onFailure(reasonCode: Int) { val r = getFailureReasonString(reasonCode); Log.w("DevicesViewModel", "stopP2pDiscovery.onFailure - $r ($reasonCode)"); if (!isRetry) permissionRequestStatus.value = "Stop P2P warn ($r)"; initiateActualP2pDiscoveryAfterStop() }
+                override fun onSuccess() { 
+                    Log.i("DevicesViewModel", "stopP2pDiscovery.onSuccess()")
+                    stopTimeoutJob.cancel()
+                    if (!isRetry) permissionRequestStatus.value = "Preparing P2P discovery..."
+                    initiateActualP2pDiscoveryAfterStop() 
+                }
+                override fun onFailure(reasonCode: Int) { 
+                    val r = getFailureReasonString(reasonCode)
+                    Log.w("DevicesViewModel", "stopP2pDiscovery.onFailure - $r ($reasonCode)")
+                    stopTimeoutJob.cancel()
+                    if (!isRetry) permissionRequestStatus.value = "Stop P2P warn ($r)"
+                    initiateActualP2pDiscoveryAfterStop() 
+                }
             })
-        } catch (e: SecurityException) { Log.e("DevicesViewModel", "SecEx stopP2pDisc: ${e.message}", e); if (!isRetry) permissionRequestStatus.value = "PermErr stopP2PDisc"; initiateActualP2pDiscoveryAfterStop() }
-        catch (e: Exception) { Log.e("DevicesViewModel", "GenEx stopP2pDisc: ${e.message}", e); if (!isRetry) permissionRequestStatus.value = "Err stopP2PDisc"; initiateActualP2pDiscoveryAfterStop()}
+        } catch (e: SecurityException) { 
+            Log.e("DevicesViewModel", "SecEx stopP2pDisc: ${e.message}", e)
+            stopTimeoutJob.cancel()
+            if (!isRetry) permissionRequestStatus.value = "PermErr stopP2PDisc"
+            initiateActualP2pDiscoveryAfterStop() 
+        }
+        catch (e: Exception) { 
+            Log.e("DevicesViewModel", "GenEx stopP2pDisc: ${e.message}", e)
+            stopTimeoutJob.cancel()
+            if (!isRetry) permissionRequestStatus.value = "Err stopP2PDisc"
+            initiateActualP2pDiscoveryAfterStop()
+        }
     }
 
     @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
@@ -308,90 +357,53 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
 
 
-    fun registerP2pReceiver() {
-        if (p2pChannel == null) { Log.e("DevicesViewModel", "Cannot reg P2P receiver, channel null."); return }
-        val context = getApplication<Application>().applicationContext
-        if (p2pBroadcastReceiver == null) {
-            p2pBroadcastReceiver = WifiDirectBroadcastReceiver(wifiP2pManager, p2pChannel, this)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) { context.registerReceiver(p2pBroadcastReceiver, p2pIntentFilter, Context.RECEIVER_NOT_EXPORTED) }
-            else { context.registerReceiver(p2pBroadcastReceiver, p2pIntentFilter) }
-            Log.d("DevicesViewModel", "P2P BroadcastReceiver registered.")
-        } else { Log.d("DevicesViewModel", "P2P BroadcastReceiver already registered.") }
-    }
-    fun unregisterP2pReceiver() {
-        p2pDiscoveryTimeoutJob?.cancel()
-        if (p2pBroadcastReceiver != null) {
-            try { getApplication<Application>().applicationContext.unregisterReceiver(p2pBroadcastReceiver); Log.d("DevicesViewModel", "P2P BroadcastReceiver unregistered.") }
-            catch (e: IllegalArgumentException) { Log.w("DevicesViewModel", "Error unreg P2P receiver: ${e.message}") }
-            finally { p2pBroadcastReceiver = null }
-        } else { Log.d("DevicesViewModel", "P2P Receiver already null.")}
-    }
-
-    fun onP2pPeersAvailable(peers: Collection<WifiP2pDevice>, fromGroupInfo: Boolean = false) {
-        p2pDiscoveryTimeoutJob?.cancel()
-        viewModelScope.launch {
-            Log.d("DevicesViewModel", "onP2pPeersAvailable received ${peers.size} peers. FromGroupInfo: $fromGroupInfo")
-            if(fromGroupInfo){
-                wifiDirectPeersInternal.clear()
-                wifiDirectPeersInternal.addAll(peers)
-            } else {
-                wifiDirectPeersInternal.clear()
-                wifiDirectPeersInternal.addAll(peers)
-            }
-            updateDisplayableDeviceList()
-
-            val currentStatus = permissionRequestStatus.value
-            if (peers.isEmpty()) {
-                Log.d("DevicesViewModel", "No P2P peers reported by system.")
-                if (!fromGroupInfo && (currentStatus.startsWith("P2P Discovery started") || currentStatus.contains("Retrying") || currentStatus.startsWith("Refreshing current group members"))) {
-                    permissionRequestStatus.value = "No P2P devices found nearby."
-                } else if (fromGroupInfo && currentStatus.startsWith("Displaying current group members")) {
-                    permissionRequestStatus.value = "Current P2P group is empty (besides this device if owner)."
-                }
-            } else {
-                Log.i("DevicesViewModel", "P2P Peers list updated. Count: ${peers.size}")
-                if (!fromGroupInfo && (currentStatus.startsWith("P2P Discovery started") || currentStatus.startsWith("No P2P devices found") || currentStatus.contains("Retrying"))) {
-                    permissionRequestStatus.value = "${peers.size} P2P device(s) found."
-                } else if (fromGroupInfo && currentStatus.startsWith("Displaying current group members")) {
-                    permissionRequestStatus.value = "Group has ${peers.size} other member(s)."
-                }
-            }
-            _isRefreshing.value = false
-        }
-    }
-
     @SuppressLint("MissingPermission")
-    fun forceRequestP2pPeers() {
-        Log.i("DevicesViewModel", "forceRequestP2pPeers() called.")
-        if (wifiP2pManager == null || p2pChannel == null) { Log.e("DevicesViewModel", "forceReqP2pPeers - P2PManager/Channel null."); permissionRequestStatus.value = "P2P System not ready."; _isRefreshing.value = false; return }
-        val context = getApplication<Application>().applicationContext
-        if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) { Log.w("DevicesViewModel", "forceReqP2pPeers - Perm missing."); permissionRequestStatus.value = "Location perm needed."; _isRefreshing.value = false; return }
-        _isRefreshing.value = true
-        try {
-            wifiP2pManager?.requestPeers(p2pChannel) { peers ->
-                Log.i("DevicesViewModel", "forceReqP2pPeers - onPeersAvailable. Size: ${peers?.deviceList?.size ?: "null"}")
-                onP2pPeersAvailable(peers?.deviceList ?: emptyList(), fromGroupInfo = _p2pGroupInfo.value != null)
-            }
-            permissionRequestStatus.value = "Requesting current P2P peer list..."
-        } catch (e: SecurityException) { Log.e("DevicesViewModel", "SecEx forceReqP2pPeers: ${e.message}", e); permissionRequestStatus.value = "PermErr req P2P peers."; _isRefreshing.value = false; }
-    }
-
-    @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
     fun connectToP2pDevice(device: WifiP2pDevice) {
-        Log.i("DevicesViewModel", "connectToP2pDevice: ${device.deviceName}")
-        if (wifiP2pManager == null || p2pChannel == null) { Log.e("DevicesViewModel", "Cannot connect P2P: Manager/Channel null."); permissionRequestStatus.value = "P2P Connect Error: Service not ready."; return }
-        val context = getApplication<Application>().applicationContext
-        if (!getWifiDirectPermissions().all { ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }){
-            Log.e("DevicesViewModel", "connectToP2pDevice - Missing P2P permissions."); permissionRequestStatus.value = "P2P perm needed for connect."; return
+        Log.i("DevicesViewModel", "connectToP2pDevice: ${device.deviceName} (status: ${device.status})")
+        if (wifiP2pManager == null || p2pChannel == null) {
+            Log.e("DevicesViewModel", "Cannot connect P2P: Manager/Channel null.")
+            permissionRequestStatus.value = "P2P Connect Error: Service not ready."
+            return
         }
-        val config = WifiP2pConfig().apply { deviceAddress = device.deviceAddress }
-        Log.d("DevicesViewModel", "P2P Connecting to ${device.deviceAddress}")
+        val context = getApplication<Application>().applicationContext
+        if (!getWifiDirectPermissions().all { ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }) {
+            Log.e("DevicesViewModel", "connectToP2pDevice - Missing P2P permissions.")
+            permissionRequestStatus.value = "P2P perm needed for connect."
+            return
+        }
+
+        // Only connect if device is AVAILABLE
+        if (device.status != WifiP2pDevice.AVAILABLE) {
+            Log.w("DevicesViewModel", "Device ${device.deviceName} is not AVAILABLE (status: ${getDeviceP2pStatusString(device.status)}), skipping connect.")
+            permissionRequestStatus.value = "Device is not available for connection."
+            return
+        }
+
+        val config = WifiP2pConfig().apply {
+            deviceAddress = device.deviceAddress
+        }
+
         try {
             wifiP2pManager?.connect(p2pChannel, config, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { Log.i("DevicesViewModel", "P2P Connect INITIATION to ${device.deviceName} SUCCEEDED."); permissionRequestStatus.value = "P2P Connecting to ${device.deviceName}..." }
-                override fun onFailure(reasonCode: Int) { val r = getDetailedFailureReasonString(reasonCode); Log.e("DevicesViewModel", "P2P Connect INITIATION FAILED to ${device.deviceName}. Reason: $r ($reasonCode)"); permissionRequestStatus.value = "P2P Connect Failed: $r" }
+                override fun onSuccess() {
+                    Log.i("DevicesViewModel", "P2P Connect INITIATION to ${device.deviceName} SUCCEEDED.")
+                    permissionRequestStatus.value = "P2P Connecting to ${device.deviceName}..."
+                }
+                override fun onFailure(reasonCode: Int) {
+                    val r = getDetailedFailureReasonString(reasonCode)
+                    Log.e("DevicesViewModel", "P2P Connect INITIATION FAILED to ${device.deviceName}. Reason: $r ($reasonCode)")
+                    permissionRequestStatus.value = "P2P Connect Failed: $r"
+                    // Restart discovery on failure
+                    startP2pDiscovery()
+                }
             })
-        } catch (e: SecurityException) { Log.e("DevicesViewModel", "SecEx P2P connect: ${e.message}", e); permissionRequestStatus.value = "PermErr P2P connect." }
+        } catch (e: SecurityException) {
+            Log.e("DevicesViewModel", "SecEx P2P connect: ${e.message}", e)
+            permissionRequestStatus.value = "PermErr P2P connect."
+        } catch (e: Exception) {
+            Log.e("DevicesViewModel", "Unexpected error during P2P connect: ${e.message}", e)
+            permissionRequestStatus.value = "P2P Connect Error: ${e.message}"
+        }
     }
 
 
@@ -742,7 +754,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         } catch (e: SecurityException) { Log.w("DevicesViewModel", "SecEx stopP2PDisc during reset: ${e.message}", e)}
         catch (e: Exception) { Log.w("DevicesViewModel", "Ex stopP2PDisc during reset: ${e.message}")}
         unregisterP2pReceiver()
-        p2pChannel = null; wifiDirectPeersInternal.clear(); _p2pGroupInfo.value = null; updateDisplayableDeviceList()
+        p2pChannel = null; wifiDirectPeersInternal.clear(); updateDisplayableDeviceList()
         viewModelScope.launch {
             delay(500); initializeWifiP2p(isReset = true); delay(300)
             permissionRequestStatus.value = if (p2pChannel != null) "P2P Reset complete. Try discovery." else "P2P Reset failed to re-init channel."
@@ -863,6 +875,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     Log.d("DevicesViewModel", "Received SYNC_REQUEST_METADATA for folder: ${message.folderName}")
                     permissionRequestStatus.value = "Received sync request for '${message.folderName}'"
                     _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "Unknown", status = "Initiated (Receiver)", details = "Received sync request for folder."))
+                    persistHistory()
                     val folderName = message.folderName
                     val localFolderUri = _activeSyncDestinationUris.value[folderName]
 
@@ -873,19 +886,50 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     }
 
                     launch(Dispatchers.IO) {
-                        val localFilesToCompare = getLocalFileMetadata(localFolderUri)
-                        val remoteFileMetadata = message.fileMetadataList ?: emptyList()
+                        val localFiles = getLocalFileMetadata(localFolderUri)
+                        val remoteFiles = message.fileMetadataList ?: emptyList()
                         val filesToRequest = mutableListOf<String>()
-                        val localFileMap = localFilesToCompare.associateBy { it.relativePath }
+                        val localFileMap = localFiles.associateBy { it.relativePath }
+                        val remoteFileMap = remoteFiles.associateBy { it.relativePath }
+                        val conflicts = mutableListOf<FileConflict>()
 
-                        remoteFileMetadata.forEach { remoteFile ->
-                            val localFile = localFileMap[remoteFile.relativePath]
-                            if (localFile == null || remoteFile.lastModified > localFile.lastModified) {
-                                filesToRequest.add(remoteFile.relativePath)
+                        for ((remotePath, remoteMeta) in remoteFileMap) {
+                            val localMeta = localFileMap[remotePath]
+                            if (localMeta == null) {
+                                // File exists on remote but not local, request it
+                                filesToRequest.add(remotePath)
+                            } else {
+                                // File exists on both, compare size first
+                                if (remoteMeta.size != localMeta.size) {
+                                    // Sizes differ, check hash
+                                    if (remoteMeta.hash != localMeta.hash) {
+                                        // Conflict detected: both exist, but content differs
+                                        conflicts.add(FileConflict(folderName ?: "", remotePath, localMeta, remoteMeta))
+                                    }
+
+                                }
+                                // If sizes are the same, treat as identical, skip (even if hash/lastModified differ)
                             }
                         }
+                        // --- Pause sync and show conflicts if any ---
+                        if (conflicts.isNotEmpty()) {
+                            _fileConflicts.value = conflicts
+                            withContext(Dispatchers.Main) {
+                                _isRefreshing.value = false
+                                permissionRequestStatus.value = "File conflicts detected. Please resolve." 
+                            }
+                            return@launch
+                        }
+                        // --- No conflicts, proceed as before ---
                         Log.d("DevicesViewModel", "Requesting ${filesToRequest.size} files for folder '${message.folderName}': $filesToRequest")
                         sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = message.folderName, requestedFilePaths = filesToRequest))
+                        sendMessage(
+                            SyncMessage(
+                                type = MessageType.SYNC_REQUEST_METADATA,
+                                folderName = folderName,
+                                fileMetadataList = localFiles
+                            )
+                        )
                     }
                 }
                 MessageType.FILES_REQUESTED_BY_PEER -> {
@@ -899,6 +943,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         Log.e("DevicesViewModel", "Sender URI for folder '${baseFolderName}' not found. Cannot send files. This requires sender-side URI management or a different way to identify source URIs.")
                         sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = baseFolderName, errorMessage = "Source folder '${baseFolderName}' not found/mappable on sender."))
                         _syncHistory.add(0, SyncHistoryEntry(folderName = baseFolderName ?: "Unknown", status = "Error", details = "Source folder not found/mappable on sender."))
+                        persistHistory()
                         return@launch
                     }
 
@@ -910,6 +955,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     }
                     if (requestedPaths.isNullOrEmpty()){
                         sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = message.folderName))
+                        // --- Fix: Re-enable sync button if no files to send ---
+                        _isRefreshing.value = false
+                        permissionRequestStatus.value = "Sync complete (no files to send)."
                     } else {
                         Log.d("DevicesViewModel", "TODO: Need to track completion of ${requestedPaths.size} file sends before sending SYNC_COMPLETE.")
                     }
@@ -921,6 +969,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         Log.e("DevicesViewModel", "FILE_TRANSFER_START missing info or folderName.")
                         sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, errorMessage = "Incomplete file transfer request from sender."))
                         _syncHistory.add(0, SyncHistoryEntry(folderName = folderName ?: "Unknown", status = "Error", details = "Incomplete file transfer request from sender."))
+                        persistHistory()
                         return@launch
                     }
 
@@ -935,6 +984,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         Log.e("DevicesViewModel", "No specific or default destination URI set for folder: $folderName. Cannot receive file: ${info.relativePath}")
                         sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = folderName, errorMessage = "Destination folder '$folderName' not configured on receiver for file '${info.relativePath}'."))
                         _syncHistory.add(0, SyncHistoryEntry(folderName = folderName, status = "Error", details = "Destination folder not configured for file '${info.relativePath}'."))
+                        persistHistory()
                         return@launch
                     }
 
@@ -947,6 +997,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         destinationBaseUri = destinationUri
                     )
                     _syncHistory.add(0, SyncHistoryEntry(folderName = folderName, status = "File Transfer", details = "Receiving file: ${info.relativePath} (${info.fileSize} bytes)"))
+                    persistHistory()
                 }
                 MessageType.FILE_CHUNK -> { message.fileChunkData?.let { appendFileChunk(it) } }
                 MessageType.FILE_TRANSFER_END -> {
@@ -956,10 +1007,26 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 MessageType.SYNC_COMPLETE -> {
                     Log.i("DevicesViewModel", "SYNC_COMPLETE received for folder: ${message.folderName}"); permissionRequestStatus.value = "Sync complete for '${message.folderName}'."; _isRefreshing.value = false
                     _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "Unknown", status = "Completed", details = "Sync successfully completed for folder."))
+                    persistHistory()
+                    // --- Reset syncMetadataSentForSession at the end of a sync ---
+                    syncMetadataSentForSession = false
                 }
                 MessageType.ERROR_MESSAGE -> {
                     Log.e("DevicesViewModel", "Received ERROR_MESSAGE: ${message.errorMessage}"); permissionRequestStatus.value = "Error from peer: ${message.errorMessage}"
                     _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "Associated with error", status = "Error", details = "Error during sync: ${message.errorMessage}"))
+                    persistHistory()
+                }
+                MessageType.DISCONNECT -> {
+                    _p2pConnectionStatus.value = "Disconnected (by peer)"
+                    permissionRequestStatus.value = "Peer disconnected."
+                    // Close the P2P connection if still open
+                    viewModelScope.launch(Dispatchers.IO) {
+                        closeCommunicationStreams()
+                        closeP2pSockets()
+                        withContext(Dispatchers.Main) {
+                            _isRefreshing.value = false
+                        }
+                    }
                 }
             }
         }
@@ -976,7 +1043,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         connectedBluetoothSocket = socket
         setupCommunicationStreams(socket, CommunicationTechnology.BLUETOOTH)
         _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Connected", details = "Bluetooth connection accepted.", peerDeviceName = remoteDeviceName))
-
+        persistHistory()
 
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.Main) {
             _bluetoothConnectionStatus.value = "Accepted connection from $remoteDeviceName"
@@ -985,7 +1052,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun handleP2pConnectionInfo(info: WifiP2pInfo) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch {
             if (info.groupFormed) {
                 val peerDeviceName = if (info.isGroupOwner) "P2P Group Client" else info.groupOwnerAddress?.hostAddress ?: "P2P Group Owner"
                 if (info.isGroupOwner) {
@@ -993,16 +1060,19 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Group Owner: Starting Server..." }
                     startP2pServer()
                     _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Connected (Owner)", details = "P2P Group formed, acting as owner.", peerDeviceName = "Group Client (TBD)"))
+                    persistHistory()
                 } else {
                     Log.i("DevicesViewModel", "P2P Client. Connecting to Group Owner: ${info.groupOwnerAddress?.hostAddress}")
                     if (info.groupOwnerAddress?.hostAddress != null) {
                         withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Client: Connecting to Owner..." }
                         connectToP2pOwner(info.groupOwnerAddress.hostAddress)
                         _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Connected (Client)", details = "P2P Group formed, acting as client.", peerDeviceName = info.groupOwnerAddress.hostAddress))
+                        persistHistory()
                     } else {
                         Log.e("DevicesViewModel", "P2P Client: Group owner address is null!")
                         withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Error: Owner address null" }
                         _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P Connection failed: Group owner address null."))
+                        persistHistory()
                         disconnectP2p()
                     }
                 }
@@ -1011,7 +1081,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Disconnected (Group not formed)" }
                 // Add history if a sync was active
                 if (_isRefreshing.value) {
-                     _syncHistory.add(0, SyncHistoryEntry(folderName = "Active Sync", status = "Error", details = "P2P Group not formed or connection lost during active sync."))
+                    _syncHistory.add(0, SyncHistoryEntry(folderName = "Active Sync", status = "Error", details = "P2P Group not formed or connection lost during active sync."))
                 }
                 disconnectP2p()
             }
@@ -1065,10 +1135,12 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 Log.e("DevicesViewModel", "P2P server ServerSocket() failed: ${e.message}", e)
                 withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Server Error: ${e.message}" }
                  _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P Server failed to start: ${e.message}"))
+                persistHistory()
             } catch (se: SecurityException) {
                 Log.e("DevicesViewModel", "SecEx starting P2P server: ${se.message}", se)
                 withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Server Permission Error" }
                  _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P Server permission error: ${se.message}"))
+                persistHistory()
             } finally {
                 Log.d("DevicesViewModel", "P2P server thread ending.")
                 closeP2pServerSocket()
@@ -1085,6 +1157,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             Log.e("DevicesViewModel", "Cannot connect to P2P owner: address is null.")
             _p2pConnectionStatus.value = "Error: Owner address null"
              _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "Cannot connect to P2P owner: address is null."))
+            persistHistory()
             return
         }
         if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH && connectedBluetoothSocket != null) {
@@ -1109,11 +1182,13 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 Log.e("DevicesViewModel", "P2P client connection failed: ${e.message}", e)
                 withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Connection Failed: ${e.localizedMessage}" }
                 _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P client connection failed: ${e.message}", peerDeviceName = ownerAddress))
+                persistHistory()
                 closeP2pClientSocket()
             } catch (se: SecurityException) {
                 Log.e("DevicesViewModel", "SecurityException during P2P client connection: ${se.message}", se)
                 withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Connection Permission Error" }
                  _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P client connection permission error: ${se.message}", peerDeviceName = ownerAddress))
+                persistHistory()
                 closeP2pClientSocket()
             }
         }
@@ -1139,8 +1214,15 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     fun disconnectP2p() {
         viewModelScope.launch(Dispatchers.IO) {
             Log.i("DevicesViewModel", "Disconnecting P2P...")
+            // Send DISCONNECT message to peer before closing
+            try {
+                sendMessage(com.example.syncshare.protocol.SyncMessage(com.example.syncshare.protocol.MessageType.DISCONNECT))
+            } catch (e: Exception) {
+                Log.w("DevicesViewModel", "Failed to send DISCONNECT message: ${e.message}")
+            }
             if (_isRefreshing.value && (p2pClientSocket != null || p2pServerSocket != null) ) { // If a sync was active
                 _syncHistory.add(0, SyncHistoryEntry(folderName = "Active Sync", status = "Error", details = "P2P Disconnected during active sync."))
+                persistHistory()
             }
             p2pServerJob?.cancel()
             p2pServerJob = null
@@ -1181,12 +1263,15 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 if (file.isFile) {
                     val relativePath = if (currentRelativePath.isEmpty()) file.name ?: "" else "$currentRelativePath/${file.name}"
                     if (relativePath.isNotEmpty()) {
+                        // --- Compute hash for file ---
+                        val hash = computeFileHash(context, file)
                         metadataList.add(
                             FileMetadata(
                                 relativePath = relativePath,
                                 name = file.name ?: "Unknown Name",
                                 size = file.length(),
-                                lastModified = file.lastModified()
+                                lastModified = file.lastModified(),
+                                hash = hash
                             )
                         )
                     }
@@ -1203,12 +1288,31 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         return metadataList
     }
 
+    // --- Helper to compute SHA-256 hash of a file ---
+    private fun computeFileHash(context: Context, file: DocumentFile): String {
+        try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            context.contentResolver.openInputStream(file.uri)?.use { inputStream ->
+                val buffer = ByteArray(8192)
+                var bytesRead: Int
+                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                    digest.update(buffer, 0, bytesRead)
+                }
+            }
+            return digest.digest().joinToString("") { "%02x".format(it) }
+        } catch (e: Exception) {
+            Log.e("DevicesViewModel", "Error computing hash for file: ${file.uri}", e)
+            return ""
+        }
+    }
+
     fun initiateSyncRequest(folderUri: Uri) {
         if (objectOutputStream == null) {
             Log.e("DevicesViewModel", "Cannot initiate sync: Communication streams not ready.")
             permissionRequestStatus.value = "Error: Not connected for sync."
             val folderNameForHistory = DocumentFile.fromTreeUri(getApplication(), folderUri)?.name ?: folderUri.toString()
             _syncHistory.add(0, SyncHistoryEntry(folderName = folderNameForHistory, status = "Error", details = "Cannot initiate sync: Not connected."))
+            persistHistory()
             return
         }
         val context = getApplication<Application>().applicationContext
@@ -1220,12 +1324,16 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         _activeSyncDestinationUris.value = currentMap.toMap()
         // -------------------------------------------------
 
+        // --- Reset syncMetadataSentForSession at the start of a sync ---
+        syncMetadataSentForSession = true
+
         viewModelScope.launch {
             permissionRequestStatus.value = "Preparing to sync folder: $folderNameForSyncMessage"
             _isRefreshing.value = true
 
             val folderNameForHistory = DocumentFile.fromTreeUri(getApplication(), folderUri)?.name ?: folderUri.toString()
             _syncHistory.add(0, SyncHistoryEntry(folderName = folderNameForHistory, status = "Initiated (Sender)", details = "Sync request initiated for folder."))
+            persistHistory()
 
             val localMetadata = withContext(Dispatchers.IO) {
                 getLocalFileMetadata(folderUri)
@@ -1242,6 +1350,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    // --- Track outstanding file sends for two-way sync ---
+    private var pendingFileSends = mutableSetOf<String>()
+
     private suspend fun sendFile(baseFolderUri: Uri, relativePath: String, syncFolderName: String) {
         Log.d("DevicesViewModel", "sendFile: relativePath '$relativePath' from base URI '$baseFolderUri' for sync folder '$syncFolderName'")
         val context = getApplication<Application>().applicationContext
@@ -1256,6 +1367,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             Log.e("DevicesViewModel", "Base folder URI is invalid or not a directory: $baseFolderUri")
             sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = syncFolderName, errorMessage = "Source folder not found on sender: $syncFolderName"))
             _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Error", details = "Source folder not found on sender for file $relativePath."))
+            persistHistory()
             return
         }
 
@@ -1267,6 +1379,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 Log.e("DevicesViewModel", "File segment not found: '$segment' in '$relativePath' under URI '$baseFolderUri'")
                 sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = syncFolderName, errorMessage = "File not found on sender: $relativePath"))
                  _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Error", details = "File not found on sender: $relativePath (segment: $segment)."))
+                persistHistory()
                 return
             }
         }
@@ -1275,6 +1388,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             Log.e("DevicesViewModel", "Target DocumentFile is null or not a file for relativePath: $relativePath")
             sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = syncFolderName, errorMessage = "File not found or is not a file on sender: $relativePath"))
             _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Error", details = "File not found or is not a file on sender: $relativePath."))
+            persistHistory()
             return
         }
 
@@ -1284,6 +1398,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         withContext(Dispatchers.Main) {
             permissionRequestStatus.value = "Sending: $relativePath from $syncFolderName..."
         }
+
+        // --- Track this file as pending ---
+        pendingFileSends.add(relativePath)
 
         val bufferSize = 4096
         val buffer = ByteArray(bufferSize)
@@ -1297,25 +1414,16 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 Log.e("DevicesViewModel", "Failed to open InputStream for ${targetDocumentFile.uri}")
                 sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = syncFolderName, errorMessage = "Failed to read file on sender: $relativePath"))
                 _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Error", details = "Failed to read file on sender: $relativePath."))
+                pendingFileSends.remove(relativePath)
                 return
             }
             while (fis.read(buffer).also { bytesRead = it } != -1 && currentCoroutineContext().isActive) {
                 if (bytesRead > 0) {
                     try {
                         val chunkToSend = buffer.copyOf(bytesRead)
-                        if (chunkToSend.size != bytesRead) {
-                            Log.w("DevicesViewModel", "Chunk size mismatch: chunkToSend.size=${chunkToSend.size}, bytesRead=$bytesRead")
-                        }
-                        Log.d("DevicesViewModel", "Preparing to send chunk $chunkCount: bytesRead=$bytesRead, chunkToSend.size=${chunkToSend.size}, first 8 bytes: ${chunkToSend.take(8).joinToString(" ") { String.format("%02x", it) }}, last 8 bytes: ${chunkToSend.takeLast(8).joinToString(" ") { String.format("%02x", it) }}")
-                        try {
-                            sendMessage(SyncMessage(MessageType.FILE_CHUNK, folderName = syncFolderName, fileChunkData = chunkToSend))
-                        } catch (e: Exception) {
-                            Log.e("DevicesViewModel", "Exception sending chunk $chunkCount: ${e.message}", e)
-                            throw e
-                        }
+                        sendMessage(SyncMessage(MessageType.FILE_CHUNK, folderName = syncFolderName, fileChunkData = chunkToSend))
                         totalBytesSent += bytesRead
                         chunkCount++
-                        Log.d("DevicesViewModel", "Sent chunk $chunkCount of size $bytesRead for $relativePath (total sent: $totalBytesSent)")
                     } catch (e: Exception) {
                         Log.e("DevicesViewModel", "Exception preparing chunk $chunkCount: bytesRead=$bytesRead, buffer.size=${buffer.size}", e)
                         throw e
@@ -1331,6 +1439,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         if (!currentCoroutineContext().isActive) {
             Log.w("DevicesViewModel", "File sending for $relativePath was cancelled during/after read loop.")
             _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Cancelled", details = "File sending for $relativePath was cancelled."))
+            pendingFileSends.remove(relativePath)
             return
         }
         Log.i("DevicesViewModel", "Finished sending chunks for $relativePath from $syncFolderName, total $totalBytesSent bytes.")
@@ -1346,6 +1455,16 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         } else {
             Log.w("DevicesViewModel", "File sending for $relativePath was cancelled, FILE_TRANSFER_END not sent.")
              _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Cancelled", details = "File sending for $relativePath cancelled, FILE_TRANSFER_END not sent."))
+            persistHistory()
+        }
+
+        // --- Remove from pending and re-enable sync button if done ---
+        pendingFileSends.remove(relativePath)
+        if (pendingFileSends.isEmpty()) {
+            withContext(Dispatchers.Main) {
+                _isRefreshing.value = false
+                permissionRequestStatus.value = "Sync complete for '$syncFolderName'."
+            }
         }
     }
 
@@ -1356,6 +1475,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         val context = getApplication<Application>().applicationContext
         permissionRequestStatus.value = "Set '${DocumentFile.fromTreeUri(context,destinationUri)?.name ?: destinationUri}' as destination for syncs named '$folderName'."
         Log.d("DevicesViewModel", "Destination URI for sync folder '$folderName' set to '$destinationUri'. Current map: ${_activeSyncDestinationUris.value}")
+        // --- Also add to ManageFoldersViewModel for future syncs ---
+        manageFoldersViewModel?.addFolder(destinationUri)
     }
 
     fun setDefaultIncomingUri(uri: Uri) {
@@ -1389,6 +1510,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 if (parentDocFile == null || !parentDocFile.isDirectory) {
                     Log.e("DevicesViewModel", "Destination base URI is invalid or not a directory: ${state.destinationBaseUri}")
                      _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "Cannot receive ${state.relativePath}: Destination base URI invalid."))
+                    persistHistory()
                     return
                 }
 
@@ -1403,6 +1525,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         if (childDocFile == null) {
                             Log.e("DevicesViewModel", "Failed to create directory: $segment in ${state.destinationBaseUri}")
                             _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "Cannot receive ${state.relativePath}: Failed to create directory $segment."))
+                            persistHistory()
                             return
                         }
                     }
@@ -1420,6 +1543,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 if (targetDocFile == null || !targetDocFile.canWrite()) {
                     Log.e("DevicesViewModel", "Cannot create or write to target file: ${state.relativePath} in ${state.destinationBaseUri}")
                     _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "Cannot create/write target file: ${state.relativePath}."))
+                    persistHistory()
                     return
                 }
                 // --- Always open in 'w' mode, only once per file ---
@@ -1428,6 +1552,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 if (currentFileOutputStream == null) {
                     Log.e("DevicesViewModel", "Failed to open OutputStream for ${targetDocFile.uri}")
                      _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "Failed to open output stream for ${state.relativePath}."))
+                    persistHistory()
                     return
                 }
                 Log.d("DevicesViewModel", "Receiving to file: ${targetDocFile.uri} (size: ${state.totalSize})")
@@ -1449,12 +1574,14 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             try { currentFileOutputStream?.close() } catch (ioe: IOException) {}
             currentFileOutputStream = null
             _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "IOException writing chunk for ${state.relativePath}: ${e.message}"))
+            persistHistory()
             currentReceivingFile = null
         } catch (e: Exception) {
             Log.e("DevicesViewModel", "Exception writing file chunk for ${state.relativePath}: ${e.message}", e)
             try { currentFileOutputStream?.close() } catch (ioe: IOException) {}
             currentFileOutputStream = null
             _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "Exception writing chunk for ${state.relativePath}: ${e.message}"))
+            persistHistory()
             currentReceivingFile = null
         }
     }
@@ -1474,7 +1601,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "File size mismatch for ${state.relativePath}. Expected ${state.totalSize}, got ${state.bytesReceived}."))
             } else {
                  _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "File Received", details = "File ${state.relativePath} received successfully."))
+                
             }
+            persistHistory()
             // --- Log first 16 bytes of the written file ---
             stateFileUriForDebug?.let { uri ->
                 try {
@@ -1491,15 +1620,21 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             }
             // --- Trigger media scan if file is an image or media ---
             stateMediaScanUri?.let { uri ->
-                val scanIntent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)
-                scanIntent.data = uri
-                getApplication<Application>().applicationContext.sendBroadcast(scanIntent)
-                Log.d("DevicesViewModel", "Media scan triggered for $uri")
+                val context = getApplication<Application>().applicationContext
+                android.media.MediaScannerConnection.scanFile(
+                    context,
+                    arrayOf(uri.toString()),
+                    null
+                ) { path, uri ->
+                    Log.d("DevicesViewModel", "Media scan completed for $uri at $path")
+                }
+                Log.d("DevicesViewModel", "Media scan triggered for $uri (MediaScannerConnection)")
                 stateMediaScanUri = null
             }
         } catch (e: IOException) {
             Log.e("DevicesViewModel", "IOException finalizing file ${state.relativePath}: ${e.message}", e)
             _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "IOException finalizing file ${state.relativePath}: ${e.message}"))
+            persistHistory()
         } finally {
             currentFileOutputStream = null
             currentReceivingFile = null
@@ -1564,5 +1699,45 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             pendingSyncMessage = null
             handleIncomingMessage(msg)
         }
+    }
+
+    /**
+     * Fully resets all P2P state, peer/device lists, and statuses, as if the app just started.
+     * Use this for a true 'fresh start' after disconnect.
+     */
+    fun fullResetP2pConnection() {
+        Log.i("DevicesViewModel", "fullResetP2pConnection CALLED - Full P2P state reset")
+        // Try to remove the group at the system level
+        try {
+            if (wifiP2pManager != null && p2pChannel != null) {
+                wifiP2pManager?.removeGroup(p2pChannel, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() {
+                        Log.i("DevicesViewModel", "removeGroup succeeded in fullResetP2pConnection")
+                    }
+                    override fun onFailure(reason: Int) {
+                        Log.w("DevicesViewModel", "removeGroup failed in fullResetP2pConnection: reason $reason")
+                    }
+                })
+            }
+        } catch (e: Exception) {
+            Log.e("DevicesViewModel", "Exception in removeGroup during fullResetP2pConnection: ${e.message}", e)
+        }
+        resetWifiDirectSystem()
+        // Clear all peer/device lists and statuses
+        wifiDirectPeersInternal.clear()
+        bluetoothDevicesInternal.clear()
+        displayableDeviceList.clear()
+        _p2pConnectionStatus.value = "Disconnected"
+        _isRefreshing.value = false
+        permissionRequestStatus.value = "Idle. Tap a scan button."
+    }
+
+    // --- Reference to ManageFoldersViewModel for folder registration ---
+    private var manageFoldersViewModel: ManageFoldersViewModel? = null
+    fun setManageFoldersViewModel(vm: ManageFoldersViewModel) { manageFoldersViewModel = vm }
+
+    fun clearHistory() {
+        _syncHistory.clear()
+        persistHistory()
     }
 }

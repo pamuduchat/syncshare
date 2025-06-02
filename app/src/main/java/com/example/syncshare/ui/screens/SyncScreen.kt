@@ -9,11 +9,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.syncshare.viewmodels.ManageFoldersViewModel
 import com.example.syncshare.viewmodels.DevicesViewModel
 import android.net.Uri
-import androidx.activity.compose.rememberLauncherForActivityResult
 
 @Composable
 fun SyncScreen(
