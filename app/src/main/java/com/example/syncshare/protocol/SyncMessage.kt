@@ -12,8 +12,7 @@ data class SyncMessage(
     val chunkOffset: Long? = null,                // For FILE_CHUNK, if needed for resume
     val errorMessage: String? = null             // For ERROR_MESSAGE
 ) : Serializable {
-    // Custom equals and hashCode for ByteArray comparison if you directly embed chunks
-    // For now, relying on default behavior. If issues arise, implement these.
+    // Custom equals and hashCode for ByteArray comparison if directly embed chunks
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (javaClass != other?.javaClass) return false

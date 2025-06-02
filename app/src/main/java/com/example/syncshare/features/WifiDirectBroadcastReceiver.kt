@@ -6,11 +6,11 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.wifi.p2p.WifiP2pDevice // Ensure this import is present
-import android.net.wifi.p2p.WifiP2pDeviceList // Import this for the peers object
+import android.net.wifi.p2p.WifiP2pDevice
+import android.net.wifi.p2p.WifiP2pDeviceList
 import android.net.wifi.p2p.WifiP2pManager
 import android.net.wifi.p2p.WifiP2pInfo
-import android.os.Build // For API level checks if needed for permissions
+import android.os.Build
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import com.example.syncshare.viewmodels.DevicesViewModel
@@ -23,7 +23,7 @@ class WifiDirectBroadcastReceiver(
 
     @SuppressLint("MissingPermission") // Permissions are expected to be checked by the caller initiating discovery/connection
     override fun onReceive(context: Context, intent: Intent) {
-        val action: String? = intent.action // Good practice to get action once
+        val action: String? = intent.action
 
         when (action) {
             WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> {
@@ -32,8 +32,6 @@ class WifiDirectBroadcastReceiver(
                     Log.d("WifiDirectReceiver", "Wi-Fi P2P is enabled")
                 } else {
                     Log.d("WifiDirectReceiver", "Wi-Fi P2P is not enabled")
-                    // Optionally, update ViewModel state if P2P is disabled during an operation
-                    // viewModel.handleP2pDisabled()
                 }
             }
             WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
@@ -86,8 +84,6 @@ class WifiDirectBroadcastReceiver(
                     intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_DEVICE)
                 }
                 Log.d("WifiDirectReceiver", "WIFI_P2P_THIS_DEVICE_CHANGED_ACTION - This device: ${thisDevice?.deviceName}, Status: ${viewModel.getDeviceP2pStatusString(thisDevice?.status ?: -1)}")
-                // You could update a LiveData/StateFlow in ViewModel with thisDevice object if needed
-                // viewModel.updateThisDeviceInfo(thisDevice)
             }
         }
     }

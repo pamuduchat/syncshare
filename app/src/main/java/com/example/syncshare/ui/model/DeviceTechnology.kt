@@ -6,7 +6,5 @@ package com.example.syncshare.ui.model
 enum class DeviceTechnology {
     WIFI_DIRECT,
     BLUETOOTH_CLASSIC,
-    // BLUETOOTH_LE, // Placeholder for future Low Energy Bluetooth support
-    // NSD,          // Placeholder for future Network Service Discovery over WLAN support
     UNKNOWN
 }
