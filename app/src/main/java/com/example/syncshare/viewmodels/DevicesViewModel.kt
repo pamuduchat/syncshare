@@ -187,7 +187,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     private val KEY_HISTORY = "sync_history"
     private val gson = Gson()
 
-    private fun persistHistory() {
+    fun persistHistory() {
         val json = gson.toJson(_syncHistory)
         prefs.edit().putString(KEY_HISTORY, json).apply()
     }
@@ -204,6 +204,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         Log.d("DevicesViewModel", "DevicesViewModel - INIT BLOCK - START")
+        fullResetP2pConnection() // Always start with a clean P2P state
         loadHistory()
         viewModelScope.launch {
             initializeWifiP2p()
@@ -907,12 +908,16 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                                 // File exists on remote but not local, request it
                                 filesToRequest.add(remotePath)
                             } else {
-                                // File exists on both, compare hash
-                                if (remoteMeta.hash != localMeta.hash) {
-                                    // Conflict detected: both exist, but content differs
-                                    conflicts.add(FileConflict(folderName ?: "", remotePath, localMeta, remoteMeta))
+                                // File exists on both, compare size first
+                                if (remoteMeta.size != localMeta.size) {
+                                    // Sizes differ, check hash
+                                    if (remoteMeta.hash != localMeta.hash) {
+                                        // Conflict detected: both exist, but content differs
+                                        conflicts.add(FileConflict(folderName ?: "", remotePath, localMeta, remoteMeta))
+                                    }
+                                    // If sizes differ but hash is same, rare, but treat as conflict
                                 }
-                                // If hashes are equal, skip (already in sync)
+                                // If sizes are the same, treat as identical, skip (even if hash/lastModified differ)
                             }
                         }
                         // --- Pause sync and show conflicts if any ---
@@ -1019,6 +1024,18 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     Log.e("DevicesViewModel", "Received ERROR_MESSAGE: ${message.errorMessage}"); permissionRequestStatus.value = "Error from peer: ${message.errorMessage}"
                     _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "Associated with error", status = "Error", details = "Error during sync: ${message.errorMessage}"))
                     persistHistory()
+                }
+                MessageType.DISCONNECT -> {
+                    _p2pConnectionStatus.value = "Disconnected (by peer)"
+                    permissionRequestStatus.value = "Peer disconnected."
+                    // Close the P2P connection if still open
+                    viewModelScope.launch(Dispatchers.IO) {
+                        closeCommunicationStreams()
+                        closeP2pSockets()
+                        withContext(Dispatchers.Main) {
+                            _isRefreshing.value = false
+                        }
+                    }
                 }
             }
         }
@@ -1206,6 +1223,12 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     fun disconnectP2p() {
         viewModelScope.launch(Dispatchers.IO) {
             Log.i("DevicesViewModel", "Disconnecting P2P...")
+            // Send DISCONNECT message to peer before closing
+            try {
+                sendMessage(com.example.syncshare.protocol.SyncMessage(com.example.syncshare.protocol.MessageType.DISCONNECT))
+            } catch (e: Exception) {
+                Log.w("DevicesViewModel", "Failed to send DISCONNECT message: ${e.message}")
+            }
             if (_isRefreshing.value && (p2pClientSocket != null || p2pServerSocket != null) ) { // If a sync was active
                 _syncHistory.add(0, SyncHistoryEntry(folderName = "Active Sync", status = "Error", details = "P2P Disconnected during active sync."))
                 persistHistory()
@@ -1723,4 +1746,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     // --- Reference to ManageFoldersViewModel for folder registration ---
     private var manageFoldersViewModel: ManageFoldersViewModel? = null
     fun setManageFoldersViewModel(vm: ManageFoldersViewModel) { manageFoldersViewModel = vm }
+
+    fun clearHistory() {
+        _syncHistory.clear()
+        persistHistory()
+    }
 }

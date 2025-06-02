@@ -11,5 +11,6 @@ enum class MessageType : Serializable {
     FILE_RECEIVED_ACK,       // Server acknowledges a file
     SYNC_COMPLETE,           // Client indicates all requested files sent
     ERROR_MESSAGE,
+    DISCONNECT,
     // ToAddMore (e.g., FOLDER_LIST_REQUEST, FOLDER_LIST_RESPONSE)
 }

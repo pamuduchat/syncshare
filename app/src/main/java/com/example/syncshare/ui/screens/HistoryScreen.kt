@@ -9,6 +9,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.example.syncshare.viewmodels.DevicesViewModel
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
 
 @Composable
 fun HistoryScreen(
@@ -16,11 +18,23 @@ fun HistoryScreen(
     devicesViewModel: DevicesViewModel
 ) {
     val syncHistory = devicesViewModel.syncHistory
+    val showDialog = remember { mutableStateOf(false) }
     Column(
         modifier = modifier.fillMaxSize().padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text("Sync History", style = MaterialTheme.typography.headlineSmall)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Sync History", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+            Button(
+                onClick = { showDialog.value = true },
+                enabled = syncHistory.isNotEmpty()
+            ) {
+                Text("Clear History")
+            }
+        }
         Spacer(modifier = Modifier.height(8.dp))
         if (syncHistory.isEmpty()) {
             Text("No sync history yet.")
@@ -41,5 +55,21 @@ fun HistoryScreen(
                 }
             }
         }
+    }
+    if (showDialog.value) {
+        AlertDialog(
+            onDismissRequest = { showDialog.value = false },
+            title = { Text("Clear Sync History") },
+            text = { Text("Are you sure you want to clear the sync history?") },
+            confirmButton = {
+                TextButton(onClick = {
+                    devicesViewModel.clearHistory()
+                    showDialog.value = false
+                }) { Text("Yes") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDialog.value = false }) { Text("No") }
+            }
+        )
     }
 }
