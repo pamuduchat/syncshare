@@ -86,8 +86,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     private val MAX_P2P_DISCOVERY_RETRIES = 3
     private var p2pDiscoveryTimeoutJob: Job? = null
     private val P2P_DISCOVERY_TIMEOUT_MS = 20000L
-    private var p2pContinuousDiscoveryJob: Job? = null
-    private val P2P_CONTINUOUS_DISCOVERY_INTERVAL_MS = 30000L
 
     private val bluetoothManager by lazy {
         application.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
