@@ -43,6 +43,7 @@ android {
 dependencies {
 
     implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.documentfile)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
@@ -50,6 +51,7 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+
 
     // Navigation Compose
     implementation(libs.androidx.navigation.compose)
@@ -78,5 +80,6 @@ dependencies {
 
     implementation(libs.accompanist.swiperefresh)
 
+    implementation(libs.gson)
 
 }
