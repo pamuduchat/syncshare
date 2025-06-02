@@ -55,7 +55,6 @@ import java.io.ObjectOutputStream
 import java.net.ServerSocket
 import java.net.Socket
 import android.webkit.MimeTypeMap
-import java.security.MessageDigest
 import android.content.SharedPreferences
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
@@ -105,14 +104,13 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     private var bluetoothServerJob: Job? = null 
     private var btServerSocket: BluetoothServerSocket? = null
 
-    private var p2pServerSocket: java.net.ServerSocket? = null
-    private var p2pClientSocket: java.net.Socket? = null
+    private var p2pServerSocket: ServerSocket? = null
+    private var p2pClientSocket: Socket? = null
     private val _p2pConnectionStatus = MutableStateFlow<String>("Disconnected")
     val p2pConnectionStatus: StateFlow<String> = _p2pConnectionStatus
-    private var p2pServerJob: kotlinx.coroutines.Job? = null
+    private var p2pServerJob: Job? = null
 
     private val _activeSyncDestinationUris = MutableStateFlow<Map<String, Uri>>(emptyMap())
-    val activeSyncDestinationUrisState: StateFlow<Map<String, Uri>> = _activeSyncDestinationUris
     private var defaultIncomingFolderUri: Uri? = null
 
     // --- Sync History ---
@@ -432,7 +430,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         Log.d("DevicesViewModel", "BT_DISC: All necessary Bluetooth permissions granted.")
 
         if (bluetoothAdapter?.isDiscovering == true) {
-            Log.d("DevicesViewModel", "BT_DISC: Already discovering. Cancelling first.");
+            Log.d("DevicesViewModel", "BT_DISC: Already discovering. Cancelling first.")
             try { bluetoothAdapter?.cancelDiscovery() } catch (e: SecurityException) {Log.e("DevicesViewModel", "SecEx BT cancelDiscovery (isDiscovering): ${e.message}", e)}
         }
 
@@ -553,7 +551,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         permissionRequestStatus.value = "Connecting to BT: $deviceNameForLog..."
         _isRefreshing.value = true; _bluetoothConnectionStatus.value = "Connecting..."
 
-        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO) {
             var socket: BluetoothSocket? = null
             try {
                 Log.d("DevicesViewModel", "Creating RFCOMM socket to service with UUID: ${AppConstants.BLUETOOTH_SERVICE_UUID}")
@@ -562,23 +560,23 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 socket.connect()
                 Log.i("DevicesViewModel", "Bluetooth connection established with $deviceNameForLog")
                 connectedBluetoothSocket = socket
-                launch(kotlinx.coroutines.Dispatchers.Main) {
+                launch(Dispatchers.Main) {
                     _isRefreshing.value = false; permissionRequestStatus.value = "Connected via BT to $deviceNameForLog"; _bluetoothConnectionStatus.value = "Connected to $deviceNameForLog"
                     setupCommunicationStreams(socket, CommunicationTechnology.BLUETOOTH)
                 }
             } catch (e: IOException) {
                 Log.e("DevicesViewModel", "Bluetooth connection failed for $deviceNameForLog: ${e.message}", e)
-                launch(kotlinx.coroutines.Dispatchers.Main) { _isRefreshing.value = false; permissionRequestStatus.value = "BT Connection Failed: ${e.localizedMessage}"; _bluetoothConnectionStatus.value = "Connection Failed" }
+                launch(Dispatchers.Main) { _isRefreshing.value = false; permissionRequestStatus.value = "BT Connection Failed: ${e.localizedMessage}"; _bluetoothConnectionStatus.value = "Connection Failed" }
                 try { socket?.close() } catch (closeException: IOException) { Log.e("DevicesViewModel", "Could not close client socket post-failure", closeException) }
             } catch (se: SecurityException) {
                 Log.e("DevicesViewModel", "SecurityException during BT connection: ${se.message}", se)
-                launch(kotlinx.coroutines.Dispatchers.Main) { _isRefreshing.value = false; permissionRequestStatus.value = "BT Connection Permission Error"; _bluetoothConnectionStatus.value = "Error: Permission Denied" }
+                launch(Dispatchers.Main) { _isRefreshing.value = false; permissionRequestStatus.value = "BT Connection Permission Error"; _bluetoothConnectionStatus.value = "Error: Permission Denied" }
             }
         }
     }
 
     fun disconnectBluetooth() {
-        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO) {
             if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
                 closeCommunicationStreams()
             } else {
@@ -586,7 +584,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 catch (e: IOException) { Log.e("DevicesViewModel", "Could not close connected Bluetooth socket during disconnectBluetooth: ${e.message}") }
             }
             connectedBluetoothSocket = null
-            launch(kotlinx.coroutines.Dispatchers.Main) { _bluetoothConnectionStatus.value = "Disconnected" }
+            launch(Dispatchers.Main) { _bluetoothConnectionStatus.value = "Disconnected" }
             Log.i("DevicesViewModel", "Bluetooth disconnected.")
         }
     }
@@ -604,7 +602,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             Log.e("DevicesViewModel", "Missing $connectPerm permission for BT server."); permissionRequestStatus.value = "BT Connect perm needed for server."; return
         }
 
-        bluetoothServerJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+        bluetoothServerJob = viewModelScope.launch(Dispatchers.IO) {
             Log.i("DevicesViewModel", "Starting Bluetooth server thread...")
             permissionRequestStatus.value = "Bluetooth server starting..."
             var tempSocket: BluetoothSocket?
@@ -626,8 +624,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         handleAcceptedBluetoothConnection(socket)
                     }
                 }
-            } catch (e: IOException) { Log.e("DevicesViewModel", "BT server listenUsingRfcomm failed", e); launch(kotlinx.coroutines.Dispatchers.Main) { permissionRequestStatus.value = "BT Server Error: ${e.message}" } }
-            catch (se: SecurityException) { Log.e("DevicesViewModel", "SecEx starting BT server: ${se.message}", se); launch(kotlinx.coroutines.Dispatchers.Main) { permissionRequestStatus.value = "BT Server Permission Error" } }
+            } catch (e: IOException) { Log.e("DevicesViewModel", "BT server listenUsingRfcomm failed", e); launch(Dispatchers.Main) { permissionRequestStatus.value = "BT Server Error: ${e.message}" } }
+            catch (se: SecurityException) { Log.e("DevicesViewModel", "SecEx starting BT server: ${se.message}", se); launch(Dispatchers.Main) { permissionRequestStatus.value = "BT Server Permission Error" } }
             finally {
                 Log.d("DevicesViewModel", "Bluetooth server thread ending.")
                 try { btServerSocket?.close() } catch (e: IOException) { Log.e("DevicesViewModel", "Could not close BT server socket on exit: ${e.message}") }
@@ -672,7 +670,13 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             if (ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH) == PackageManager.PERMISSION_GRANTED) canGetName = true
             else deviceName = "Name N/A (No BT Perm)"
         }
-        if (canGetName) { try { deviceName = device.name } catch (se: SecurityException) { deviceName = "Name N/A (SecEx)" } }
+        if (canGetName) {
+            deviceName = try {
+                device.name
+            } catch (se: SecurityException) {
+                "Name N/A (SecEx)"
+            }
+        }
 
         if (!bluetoothDevicesInternal.any { it.address == device.address }) {
             Log.d("DevicesViewModel", "BT_DEVICE_ADDED_TO_INTERNAL_LIST: ${deviceName ?: "(Unnamed)"} - ${device.address}")
@@ -732,7 +736,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         Log.i("DevicesViewModel", "checkWifiDirectStatus CALLED")
         val context = getApplication<Application>().applicationContext
         val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
-        val isWifiEnabled = wifiManager?.isWifiEnabled ?: false
+        val isWifiEnabled = wifiManager?.isWifiEnabled == true
         val systemLocationEnabled = isLocationEnabled(context)
 
         val diagnosticInfo = StringBuilder().apply {
@@ -771,7 +775,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     objectInputStream = ObjectInputStream(btSocket.inputStream)
                 }
                 CommunicationTechnology.P2P -> {
-                    val p2pSocket = socket as java.net.Socket
+                    val p2pSocket = socket as Socket
                     objectOutputStream = ObjectOutputStream(p2pSocket.getOutputStream())
                     objectInputStream = ObjectInputStream(p2pSocket.inputStream)
                 }
@@ -794,7 +798,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
     private fun startListeningForMessages() {
         communicationJob?.cancel()
-        communicationJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+        communicationJob = viewModelScope.launch(Dispatchers.IO) {
             Log.i("DevicesViewModel", "Listening for incoming SyncMessages...")
             while (isActive && objectInputStream != null) {
                 try {
@@ -806,24 +810,24 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 } catch (e: IOException) {
                     if (isActive) {
                         Log.e("DevicesViewModel", "IOException while listening for messages: ${e.message}", e)
-                        launch(kotlinx.coroutines.Dispatchers.Main) { permissionRequestStatus.value = "Connection lost: ${e.message}" }
+                        launch(Dispatchers.Main) { permissionRequestStatus.value = "Connection lost: ${e.message}" }
                     }
                     break
                 } catch (e: ClassNotFoundException) {
                     Log.e("DevicesViewModel", "ClassNotFoundException while listening: ${e.message}", e)
-                    launch(kotlinx.coroutines.Dispatchers.Main) { permissionRequestStatus.value = "Protocol error." }
+                    launch(Dispatchers.Main) { permissionRequestStatus.value = "Protocol error." }
                     break
                 } catch (e: Exception) {
                     if (isActive) {
                         Log.e("DevicesViewModel", "Unexpected error listening for messages: ${e.message}", e)
-                        launch(kotlinx.coroutines.Dispatchers.Main) { permissionRequestStatus.value = "Communication error."}
+                        launch(Dispatchers.Main) { permissionRequestStatus.value = "Communication error."}
                     }
                     break
                 }
             }
             Log.i("DevicesViewModel", "Stopped listening for messages.")
             if (connectedBluetoothSocket != null || p2pIsConnected()) {
-                launch(kotlinx.coroutines.Dispatchers.Main) {
+                launch(Dispatchers.Main) {
                     if (_bluetoothConnectionStatus.value.startsWith("Connected")) _bluetoothConnectionStatus.value = "Disconnected (stream ended)"
                 }
             }
@@ -1012,7 +1016,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Connected", details = "Bluetooth connection accepted.", peerDeviceName = remoteDeviceName))
         persistHistory()
 
-        viewModelScope.launch(kotlinx.coroutines.Dispatchers.Main) {
+        viewModelScope.launch(Dispatchers.Main) {
             _bluetoothConnectionStatus.value = "Accepted connection from $remoteDeviceName"
             permissionRequestStatus.value = "BT Peer connected: $remoteDeviceName"
         }
@@ -1158,8 +1162,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 persistHistory()
                 closeP2pClientSocket()
             }
-        } else {
-            Log.d("DevicesViewModel", "Receiver was already null.")
         }
     }
 
@@ -1185,7 +1187,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             Log.i("DevicesViewModel", "Disconnecting P2P...")
             // Send DISCONNECT message to peer before closing
             try {
-                sendMessage(com.example.syncshare.protocol.SyncMessage(com.example.syncshare.protocol.MessageType.DISCONNECT))
+                sendMessage(SyncMessage(MessageType.DISCONNECT))
             } catch (e: Exception) {
                 Log.w("DevicesViewModel", "Failed to send DISCONNECT message: ${e.message}")
             }
@@ -1538,8 +1540,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
 
     // --- Store the last written file's URI for media scan and debug ---
-    private var stateMediaScanUri: android.net.Uri? = null
-    private var stateFileUriForDebug: android.net.Uri? = null
+    private var stateMediaScanUri: Uri? = null
+    private var stateFileUriForDebug: Uri? = null
 
     private fun finalizeReceivedFile() {
         val state = currentReceivingFile ?: return
@@ -1604,7 +1606,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun sendMessage(message: SyncMessage) {
-        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO) {
             try {
                 synchronized(outputStreamLock) {
                     if (message.type == MessageType.FILE_CHUNK) {
@@ -1618,7 +1620,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 Log.d("DevicesViewModel", "Sent message: Type: ${message.type}, Folder: ${message.folderName}")
             } catch (e: IOException) {
                 Log.e("DevicesViewModel", "Error sending message: ${e.message}", e)
-                launch(kotlinx.coroutines.Dispatchers.Main) { permissionRequestStatus.value = "Error sending data." }
+                launch(Dispatchers.Main) { permissionRequestStatus.value = "Error sending data." }
                 if (message.type != MessageType.ERROR_MESSAGE) { // Avoid infinite error loops
                     _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "N/A", status = "Error", details = "Failed to send message type ${message.type}: ${e.message}"))
                 }
@@ -1631,7 +1633,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     @RequiresPermission(Manifest.permission.ACCESS_FINE_LOCATION)
     fun forceRequestPeers() {
         Log.i("DevicesViewModel", "forceRequestPeers() called.")
-        if (wifiP2pManager == null || channel == null) {
+        if (wifiP2pManager == null || p2pChannel == null) {
             Log.e("DevicesViewModel", "forceRequestPeers - P2PManager or Channel is null.")
             permissionRequestStatus.value = "P2P System not ready for peer request."
             _isRefreshing.value = false
@@ -1639,11 +1641,11 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         }
         // Define or reuse your PeerListListener here
         val peerListListener = WifiP2pManager.PeerListListener { peers ->
-            Log.i("DevicesViewModel", "forceRequestPeers - PeerListListener.onPeersAvailable. System peer list size: ${peers?.deviceList?.size ?: "null"}")
-            onPeersAvailable(peers?.deviceList ?: emptyList())
+            Log.i("DevicesViewModel", "forceRequestPeers - PeerListListener.onPeersAvailable. System peer list size: [${peers?.deviceList?.size ?: "null"}")
+            onP2pPeersAvailable(peers?.deviceList ?: emptyList())
         }
         try {
-            wifiP2pManager?.requestPeers(channel, peerListListener)
+            wifiP2pManager?.requestPeers(p2pChannel, peerListListener)
         } catch (e: SecurityException) {
             Log.e("DevicesViewModel", "SecurityException during forceRequestPeers: ${e.message}", e)
             permissionRequestStatus.value = "Permission error requesting peers."
