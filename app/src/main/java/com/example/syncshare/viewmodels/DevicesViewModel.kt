@@ -59,6 +59,11 @@ import java.security.MessageDigest
 import android.content.SharedPreferences
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import com.example.syncshare.utils.getDeviceP2pStatusString
+import com.example.syncshare.utils.getBluetoothBondState
+import com.example.syncshare.utils.getFailureReasonString
+import com.example.syncshare.utils.getDetailedFailureReasonString
+import com.example.syncshare.utils.computeFileHash
 
 enum class CommunicationTechnology { BLUETOOTH, P2P }
 
@@ -703,44 +708,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         Log.d("DevicesViewModel", "Updated displayableDeviceList. Size: ${displayableDeviceList.size}")
     }
 
-    fun getDeviceP2pStatusString(deviceStatus: Int): String {
-        return when (deviceStatus) {
-            WifiP2pDevice.AVAILABLE -> "Available"
-            WifiP2pDevice.INVITED -> "Invited"
-            WifiP2pDevice.CONNECTED -> "Connected"
-            WifiP2pDevice.FAILED -> "Failed"
-            WifiP2pDevice.UNAVAILABLE -> "Unavailable"
-            else -> "Unknown P2P ($deviceStatus)"
-        }
-    }
-    @SuppressLint("MissingPermission")
-    private fun getBluetoothBondState(bondState: Int): String {
-        return when (bondState) {
-            BluetoothDevice.BOND_NONE -> "Not Paired"
-            BluetoothDevice.BOND_BONDING -> "Pairing..."
-            BluetoothDevice.BOND_BONDED -> "Paired"
-            else -> "Bond State Unknown ($bondState)"
-        }
-    }
-    private fun getFailureReasonString(reasonCode: Int): String {
-        return when (reasonCode) {
-            WifiP2pManager.ERROR -> "ERROR"
-            WifiP2pManager.P2P_UNSUPPORTED -> "P2P_UNSUPPORTED"
-            WifiP2pManager.BUSY -> "BUSY"
-            WifiP2pManager.NO_SERVICE_REQUESTS -> "NO_SERVICE_REQUESTS"
-            else -> "UNKNOWN ($reasonCode)"
-        }
-    }
-    private fun getDetailedFailureReasonString(reasonCode: Int): String {
-        val baseReason = getFailureReasonString(reasonCode)
-        return when (reasonCode) {
-            WifiP2pManager.ERROR -> "$baseReason (Generic P2P Error) - System might be temporarily unavailable. Consider resetting Wi-Fi Direct or restarting the app/device."
-            WifiP2pManager.P2P_UNSUPPORTED -> "$baseReason - This device does not support Wi-Fi Direct."
-            WifiP2pManager.BUSY -> "$baseReason - The Wi-Fi Direct system is busy. Wait or reset Wi-Fi Direct."
-            WifiP2pManager.NO_SERVICE_REQUESTS -> "$baseReason - No active service discovery requests."
-            else -> "$baseReason - An unknown P2P error occurred ($reasonCode). Try resetting."
-        }
-    }
     fun resetWifiDirectSystem() {
         Log.i("DevicesViewModel", "resetWifiDirectSystem CALLED")
         permissionRequestStatus.value = "Resetting Wi-Fi Direct..."
@@ -1286,24 +1253,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         traverse(documentFolder, "")
         Log.d("DevicesViewModel", "Found ${metadataList.size} files in $folderUri")
         return metadataList
-    }
-
-    // --- Helper to compute SHA-256 hash of a file ---
-    private fun computeFileHash(context: Context, file: DocumentFile): String {
-        try {
-            val digest = MessageDigest.getInstance("SHA-256")
-            context.contentResolver.openInputStream(file.uri)?.use { inputStream ->
-                val buffer = ByteArray(8192)
-                var bytesRead: Int
-                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                    digest.update(buffer, 0, bytesRead)
-                }
-            }
-            return digest.digest().joinToString("") { "%02x".format(it) }
-        } catch (e: Exception) {
-            Log.e("DevicesViewModel", "Error computing hash for file: ${file.uri}", e)
-            return ""
-        }
     }
 
     fun initiateSyncRequest(folderUri: Uri) {
