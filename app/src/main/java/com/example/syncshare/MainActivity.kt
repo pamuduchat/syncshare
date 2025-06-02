@@ -11,6 +11,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.navigation.NavDestination.Companion.hierarchy
@@ -50,6 +51,9 @@ import java.util.Date
 import java.util.Locale
 import com.example.syncshare.viewmodels.DevicesViewModel.ConflictResolutionOption
 import com.example.syncshare.viewmodels.DevicesViewModel.FileConflict
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -66,9 +70,17 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainAppScreen() {
     val navController = rememberNavController()
+    val context = LocalContext.current.applicationContext
     // Provide shared ViewModels at the top level
     val devicesViewModel: DevicesViewModel = viewModel()
-    val foldersViewModel: ManageFoldersViewModel = viewModel()
+    val foldersViewModel: ManageFoldersViewModel = viewModel(factory = viewModelFactory {
+        initializer { ManageFoldersViewModel(context) }
+    })
+
+    // Link DevicesViewModel to ManageFoldersViewModel for folder registration
+    LaunchedEffect(Unit) {
+        devicesViewModel.setManageFoldersViewModel(foldersViewModel)
+    }
 
     // --- Global folder mapping dialog ---
     PendingFolderMappingDialog(devicesViewModel)
