@@ -58,6 +58,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID 
 import android.webkit.MimeTypeMap
+import java.security.MessageDigest
 
 enum class CommunicationTechnology { BLUETOOTH, P2P }
 
@@ -133,6 +134,50 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
     // --- Add at the top of DevicesViewModel class ---
     private var syncMetadataSentForSession = false
+
+    // --- Conflict data class and state ---
+    data class FileConflict(
+        val folderName: String,
+        val relativePath: String,
+        val local: FileMetadata?,
+        val remote: FileMetadata?
+    )
+    private val _fileConflicts = MutableStateFlow<List<FileConflict>>(emptyList())
+    val fileConflicts: StateFlow<List<FileConflict>> = _fileConflicts
+
+    // --- Conflict resolution options ---
+    enum class ConflictResolutionOption { KEEP_LOCAL, USE_REMOTE, KEEP_BOTH, SKIP }
+
+    // --- Expose a function to resolve a conflict ---
+    fun resolveFileConflict(conflict: FileConflict, option: ConflictResolutionOption) {
+        // Remove the conflict from the list
+        val updated = _fileConflicts.value.toMutableList().apply { remove(conflict) }
+        _fileConflicts.value = updated
+        when (option) {
+            ConflictResolutionOption.KEEP_LOCAL -> {
+                // Do nothing, keep local file
+            }
+            ConflictResolutionOption.USE_REMOTE -> {
+                // Request the remote file
+                sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = conflict.folderName, requestedFilePaths = listOf(conflict.relativePath)))
+            }
+            ConflictResolutionOption.KEEP_BOTH -> {
+                // Request remote file, but with a new name (e.g., append _remote or timestamp)
+                val newPath = conflict.relativePath + "_remote_${System.currentTimeMillis()}"
+                // The receiver will need to handle this rename on receipt
+                sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = conflict.folderName, requestedFilePaths = listOf(conflict.relativePath)))
+                // You may need to track this mapping for renaming on receive
+            }
+            ConflictResolutionOption.SKIP -> {
+                // Do nothing
+            }
+        }
+        // If all conflicts resolved, resume sync if needed
+        if (_fileConflicts.value.isEmpty()) {
+            _isRefreshing.value = false
+            permissionRequestStatus.value = "All conflicts resolved. Sync can continue."
+        }
+    }
 
     init {
         Log.d("DevicesViewModel", "DevicesViewModel - INIT BLOCK - START")
@@ -824,31 +869,46 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     }
 
                     launch(Dispatchers.IO) {
-                        val localFilesToCompare = getLocalFileMetadata(localFolderUri)
-                        val remoteFileMetadata = message.fileMetadataList ?: emptyList()
+                        val localFiles = getLocalFileMetadata(localFolderUri)
+                        val remoteFiles = message.fileMetadataList ?: emptyList()
                         val filesToRequest = mutableListOf<String>()
-                        val localFileMap = localFilesToCompare.associateBy { it.relativePath }
+                        val localFileMap = localFiles.associateBy { it.relativePath }
+                        val remoteFileMap = remoteFiles.associateBy { it.relativePath }
+                        val conflicts = mutableListOf<FileConflict>()
 
-                        remoteFileMetadata.forEach { remoteFile ->
-                            val localFile = localFileMap[remoteFile.relativePath]
-                            if (localFile == null || remoteFile.lastModified > localFile.lastModified) {
-                                filesToRequest.add(remoteFile.relativePath)
+                        for ((remotePath, remoteMeta) in remoteFileMap) {
+                            val localMeta = localFileMap[remotePath]
+                            if (localMeta == null) {
+                                // File exists on remote but not local, request it
+                                filesToRequest.add(remotePath)
+                            } else {
+                                // File exists on both, compare hash
+                                if (remoteMeta.hash != localMeta.hash) {
+                                    // Conflict detected: both exist, but content differs
+                                    conflicts.add(FileConflict(folderName ?: "", remotePath, localMeta, remoteMeta))
+                                }
+                                // If hashes are equal, skip (already in sync)
                             }
                         }
+                        // --- Pause sync and show conflicts if any ---
+                        if (conflicts.isNotEmpty()) {
+                            _fileConflicts.value = conflicts
+                            withContext(Dispatchers.Main) {
+                                _isRefreshing.value = false
+                                permissionRequestStatus.value = "File conflicts detected. Please resolve." 
+                            }
+                            return@launch
+                        }
+                        // --- No conflicts, proceed as before ---
                         Log.d("DevicesViewModel", "Requesting ${filesToRequest.size} files for folder '${message.folderName}': $filesToRequest")
                         sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = message.folderName, requestedFilePaths = filesToRequest))
-
-                        // --- NEW: Also send our own file list back if we haven't already for this session ---
-                        if (!syncMetadataSentForSession) {
-                            syncMetadataSentForSession = true
-                            sendMessage(
-                                SyncMessage(
-                                    type = MessageType.SYNC_REQUEST_METADATA,
-                                    folderName = folderName,
-                                    fileMetadataList = localFilesToCompare
-                                )
+                        sendMessage(
+                            SyncMessage(
+                                type = MessageType.SYNC_REQUEST_METADATA,
+                                folderName = folderName,
+                                fileMetadataList = localFiles
                             )
-                        }
+                        )
                     }
                 }
                 MessageType.FILES_REQUESTED_BY_PEER -> {
@@ -1149,12 +1209,15 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 if (file.isFile) {
                     val relativePath = if (currentRelativePath.isEmpty()) file.name ?: "" else "$currentRelativePath/${file.name}"
                     if (relativePath.isNotEmpty()) {
+                        // --- Compute hash for file ---
+                        val hash = computeFileHash(context, file)
                         metadataList.add(
                             FileMetadata(
                                 relativePath = relativePath,
                                 name = file.name ?: "Unknown Name",
                                 size = file.length(),
-                                lastModified = file.lastModified()
+                                lastModified = file.lastModified(),
+                                hash = hash
                             )
                         )
                     }
@@ -1169,6 +1232,24 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         traverse(documentFolder, "")
         Log.d("DevicesViewModel", "Found ${metadataList.size} files in $folderUri")
         return metadataList
+    }
+
+    // --- Helper to compute SHA-256 hash of a file ---
+    private fun computeFileHash(context: Context, file: DocumentFile): String {
+        try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            context.contentResolver.openInputStream(file.uri)?.use { inputStream ->
+                val buffer = ByteArray(8192)
+                var bytesRead: Int
+                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                    digest.update(buffer, 0, bytesRead)
+                }
+            }
+            return digest.digest().joinToString("") { "%02x".format(it) }
+        } catch (e: Exception) {
+            Log.e("DevicesViewModel", "Error computing hash for file: ${file.uri}", e)
+            return ""
+        }
     }
 
     fun initiateSyncRequest(folderUri: Uri) {
@@ -1547,5 +1628,38 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             pendingSyncMessage = null
             handleIncomingMessage(msg)
         }
+    }
+
+    /**
+     * Fully resets all P2P state, peer/device lists, and statuses, as if the app just started.
+     * Use this for a true 'fresh start' after disconnect.
+     */
+    fun fullResetP2pConnection() {
+        Log.i("DevicesViewModel", "fullResetP2pConnection CALLED - Full P2P state reset")
+        // Try to remove the group at the system level
+        try {
+            if (wifiP2pManager != null && p2pChannel != null) {
+                wifiP2pManager?.removeGroup(p2pChannel, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() {
+                        Log.i("DevicesViewModel", "removeGroup succeeded in fullResetP2pConnection")
+                    }
+                    override fun onFailure(reason: Int) {
+                        Log.w("DevicesViewModel", "removeGroup failed in fullResetP2pConnection: reason $reason")
+                    }
+                })
+            }
+        } catch (e: Exception) {
+            Log.e("DevicesViewModel", "Exception in removeGroup during fullResetP2pConnection: ${e.message}", e)
+        }
+        resetWifiDirectSystem()
+        // Clear all peer/device lists and statuses
+        wifiDirectPeersInternal.clear()
+        bluetoothDevicesInternal.clear()
+        displayableDeviceList.clear()
+        _p2pConnectionStatus.value = "Disconnected"
+        _isRefreshing.value = false
+        permissionRequestStatus.value = "Idle. Tap a scan button."
+        // Optionally clear sync history if you want a full UI reset:
+        // _syncHistory.clear()
     }
 }
