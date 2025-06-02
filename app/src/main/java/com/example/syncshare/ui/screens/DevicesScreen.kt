@@ -65,40 +65,6 @@ fun DevicesScreen(
         mutableStateOf(isLocationEnabled(context))
     }
 
-    val pendingFolder = viewModel.pendingFolderMapping.value
-    val folderPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree(),
-        onResult = { uri: android.net.Uri? ->
-            if (uri != null && pendingFolder != null) {
-                context.contentResolver.takePersistableUriPermission(
-                    uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                )
-                viewModel.setDestinationUriForSync(pendingFolder, uri)
-                viewModel.pendingFolderMapping.value = null
-                viewModel.retryPendingSyncIfNeeded()
-            }
-        }
-    )
-
-    if (pendingFolder != null) {
-        AlertDialog(
-            onDismissRequest = { viewModel.pendingFolderMapping.value = null },
-            title = { Text("Select Destination Folder") },
-            text = { Text("Please select a destination folder for incoming sync: '$pendingFolder'") },
-            confirmButton = {
-                Button(onClick = { folderPickerLauncher.launch(null) }) {
-                    Text("Choose Folder")
-                }
-            },
-            dismissButton = {
-                OutlinedButton(onClick = { viewModel.pendingFolderMapping.value = null }) {
-                    Text("Cancel")
-                }
-            }
-        )
-    }
-
     val wifiDirectPermissionsLauncher = rememberPermissionsLauncher { permissionsResult ->
         var allGranted = true
         permissionsResult.forEach { (perm, granted) ->
@@ -276,6 +242,14 @@ fun DevicesScreen(
                 Icon(Icons.Filled.Info, contentDescription = "Check P2P Status", modifier = Modifier.size(ButtonDefaults.IconSize))
                 Spacer(Modifier.size(ButtonDefaults.IconSpacing))
                 Text("P2P Status")
+            }
+        }
+
+        // --- New Row: P2P Disconnect Button ---
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+            OutlinedButton(onClick = { viewModel.fullResetP2pConnection() }, enabled = !isRefreshing) {
+                Text("Disconnect P2P")
             }
         }
 
