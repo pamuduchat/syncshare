@@ -54,6 +54,10 @@ import com.example.syncshare.viewmodels.DevicesViewModel.FileConflict
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import com.example.syncshare.utils.getWifiDirectPermissions
+import com.example.syncshare.utils.getBluetoothPermissions
+import com.example.syncshare.utils.hasPermission
+import com.example.syncshare.utils.rememberPermissionsLauncher
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -70,16 +74,38 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainAppScreen() {
     val navController = rememberNavController()
-    val context = LocalContext.current.applicationContext
-    // Provide shared ViewModels at the top level
+    val context = LocalContext.current
+    val appContext = context.applicationContext
     val devicesViewModel: DevicesViewModel = viewModel()
     val foldersViewModel: ManageFoldersViewModel = viewModel(factory = viewModelFactory {
-        initializer { ManageFoldersViewModel(context) }
+        initializer { ManageFoldersViewModel(appContext) }
     })
 
     // Link DevicesViewModel to ManageFoldersViewModel for folder registration
     LaunchedEffect(Unit) {
         devicesViewModel.setManageFoldersViewModel(foldersViewModel)
+    }
+
+    // --- Permission Launchers ---
+    val wifiDirectPermissionsLauncher = rememberPermissionsLauncher { permissionsResult ->
+        // No-op: handled in DevicesScreen, just request at startup
+    }
+    val bluetoothPermissionsLauncher = rememberPermissionsLauncher { permissionsResult ->
+        // No-op: handled in DevicesScreen, just request at startup
+    }
+
+    // --- Request permissions at startup ---
+    LaunchedEffect(Unit) {
+        val wifiPerms = getWifiDirectPermissions()
+        val btPerms = getBluetoothPermissions()
+        val missingWifi = wifiPerms.any { !appContext.hasPermission(it) }
+        val missingBt = btPerms.any { !appContext.hasPermission(it) }
+        if (missingWifi) {
+            wifiDirectPermissionsLauncher.launch(wifiPerms)
+        }
+        if (missingBt) {
+            bluetoothPermissionsLauncher.launch(btPerms)
+        }
     }
 
     // --- Global folder mapping dialog ---
