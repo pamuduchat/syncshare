@@ -14,6 +14,7 @@ import android.os.Build
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import com.example.syncshare.viewmodels.DevicesViewModel
+import com.example.syncshare.utils.getDeviceP2pStatusString
 
 class WifiDirectBroadcastReceiver(
     private val manager: WifiP2pManager?,
@@ -83,7 +84,7 @@ class WifiDirectBroadcastReceiver(
                     @Suppress("DEPRECATION")
                     intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_DEVICE)
                 }
-                Log.d("WifiDirectReceiver", "WIFI_P2P_THIS_DEVICE_CHANGED_ACTION - This device: ${thisDevice?.deviceName}, Status: ${viewModel.getDeviceP2pStatusString(thisDevice?.status ?: -1)}")
+                Log.d("WifiDirectReceiver", "WIFI_P2P_THIS_DEVICE_CHANGED_ACTION - This device: ${thisDevice?.deviceName}, Status: ${getDeviceP2pStatusString(thisDevice?.status ?: -1)}")
             }
         }
     }
