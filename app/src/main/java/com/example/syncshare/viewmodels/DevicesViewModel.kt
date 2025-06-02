@@ -59,6 +59,10 @@ import java.net.Socket
 import java.util.UUID 
 import android.webkit.MimeTypeMap
 import java.security.MessageDigest
+import com.example.syncshare.viewmodels.ManageFoldersViewModel
+import android.content.SharedPreferences
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 
 enum class CommunicationTechnology { BLUETOOTH, P2P }
 
@@ -179,8 +183,28 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    private val prefs: SharedPreferences = application.getSharedPreferences("syncshare_prefs", Context.MODE_PRIVATE)
+    private val KEY_HISTORY = "sync_history"
+    private val gson = Gson()
+
+    private fun persistHistory() {
+        val json = gson.toJson(_syncHistory)
+        prefs.edit().putString(KEY_HISTORY, json).apply()
+    }
+    private fun loadHistory() {
+        val json = prefs.getString(KEY_HISTORY, null)
+        if (json != null) {
+            val type = object : TypeToken<MutableList<SyncHistoryEntry>>() {}.type
+            val list: MutableList<SyncHistoryEntry> = gson.fromJson(json, type) ?: mutableListOf()
+            _syncHistory.clear()
+            _syncHistory.addAll(list)
+            persistHistory()
+        }
+    }
+
     init {
         Log.d("DevicesViewModel", "DevicesViewModel - INIT BLOCK - START")
+        loadHistory()
         viewModelScope.launch {
             initializeWifiP2p()
             updateBluetoothState()
@@ -859,6 +883,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     Log.d("DevicesViewModel", "Received SYNC_REQUEST_METADATA for folder: ${message.folderName}")
                     permissionRequestStatus.value = "Received sync request for '${message.folderName}'"
                     _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "Unknown", status = "Initiated (Receiver)", details = "Received sync request for folder."))
+                    persistHistory()
                     val folderName = message.folderName
                     val localFolderUri = _activeSyncDestinationUris.value[folderName]
 
@@ -922,6 +947,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         Log.e("DevicesViewModel", "Sender URI for folder '${baseFolderName}' not found. Cannot send files. This requires sender-side URI management or a different way to identify source URIs.")
                         sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = baseFolderName, errorMessage = "Source folder '${baseFolderName}' not found/mappable on sender."))
                         _syncHistory.add(0, SyncHistoryEntry(folderName = baseFolderName ?: "Unknown", status = "Error", details = "Source folder not found/mappable on sender."))
+                        persistHistory()
                         return@launch
                     }
 
@@ -947,6 +973,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         Log.e("DevicesViewModel", "FILE_TRANSFER_START missing info or folderName.")
                         sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, errorMessage = "Incomplete file transfer request from sender."))
                         _syncHistory.add(0, SyncHistoryEntry(folderName = folderName ?: "Unknown", status = "Error", details = "Incomplete file transfer request from sender."))
+                        persistHistory()
                         return@launch
                     }
 
@@ -961,6 +988,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         Log.e("DevicesViewModel", "No specific or default destination URI set for folder: $folderName. Cannot receive file: ${info.relativePath}")
                         sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = folderName, errorMessage = "Destination folder '$folderName' not configured on receiver for file '${info.relativePath}'."))
                         _syncHistory.add(0, SyncHistoryEntry(folderName = folderName, status = "Error", details = "Destination folder not configured for file '${info.relativePath}'."))
+                        persistHistory()
                         return@launch
                     }
 
@@ -973,6 +1001,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         destinationBaseUri = destinationUri
                     )
                     _syncHistory.add(0, SyncHistoryEntry(folderName = folderName, status = "File Transfer", details = "Receiving file: ${info.relativePath} (${info.fileSize} bytes)"))
+                    persistHistory()
                 }
                 MessageType.FILE_CHUNK -> { message.fileChunkData?.let { appendFileChunk(it) } }
                 MessageType.FILE_TRANSFER_END -> {
@@ -982,12 +1011,14 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 MessageType.SYNC_COMPLETE -> {
                     Log.i("DevicesViewModel", "SYNC_COMPLETE received for folder: ${message.folderName}"); permissionRequestStatus.value = "Sync complete for '${message.folderName}'."; _isRefreshing.value = false
                     _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "Unknown", status = "Completed", details = "Sync successfully completed for folder."))
+                    persistHistory()
                     // --- Reset syncMetadataSentForSession at the end of a sync ---
                     syncMetadataSentForSession = false
                 }
                 MessageType.ERROR_MESSAGE -> {
                     Log.e("DevicesViewModel", "Received ERROR_MESSAGE: ${message.errorMessage}"); permissionRequestStatus.value = "Error from peer: ${message.errorMessage}"
                     _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "Associated with error", status = "Error", details = "Error during sync: ${message.errorMessage}"))
+                    persistHistory()
                 }
             }
         }
@@ -1004,7 +1035,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         connectedBluetoothSocket = socket
         setupCommunicationStreams(socket, CommunicationTechnology.BLUETOOTH)
         _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Connected", details = "Bluetooth connection accepted.", peerDeviceName = remoteDeviceName))
-
+        persistHistory()
 
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.Main) {
             _bluetoothConnectionStatus.value = "Accepted connection from $remoteDeviceName"
@@ -1021,16 +1052,19 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Group Owner: Starting Server..." }
                     startP2pServer()
                     _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Connected (Owner)", details = "P2P Group formed, acting as owner.", peerDeviceName = "Group Client (TBD)"))
+                    persistHistory()
                 } else {
                     Log.i("DevicesViewModel", "P2P Client. Connecting to Group Owner: ${info.groupOwnerAddress?.hostAddress}")
                     if (info.groupOwnerAddress?.hostAddress != null) {
                         withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Client: Connecting to Owner..." }
                         connectToP2pOwner(info.groupOwnerAddress.hostAddress)
                         _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Connected (Client)", details = "P2P Group formed, acting as client.", peerDeviceName = info.groupOwnerAddress.hostAddress))
+                        persistHistory()
                     } else {
                         Log.e("DevicesViewModel", "P2P Client: Group owner address is null!")
                         withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Error: Owner address null" }
                         _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P Connection failed: Group owner address null."))
+                        persistHistory()
                         disconnectP2p()
                     }
                 }
@@ -1093,10 +1127,12 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 Log.e("DevicesViewModel", "P2P server ServerSocket() failed: ${e.message}", e)
                 withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Server Error: ${e.message}" }
                  _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P Server failed to start: ${e.message}"))
+                persistHistory()
             } catch (se: SecurityException) {
                 Log.e("DevicesViewModel", "SecEx starting P2P server: ${se.message}", se)
                 withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Server Permission Error" }
                  _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P Server permission error: ${se.message}"))
+                persistHistory()
             } finally {
                 Log.d("DevicesViewModel", "P2P server thread ending.")
                 closeP2pServerSocket()
@@ -1113,6 +1149,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             Log.e("DevicesViewModel", "Cannot connect to P2P owner: address is null.")
             _p2pConnectionStatus.value = "Error: Owner address null"
              _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "Cannot connect to P2P owner: address is null."))
+            persistHistory()
             return
         }
         if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH && connectedBluetoothSocket != null) {
@@ -1137,11 +1174,13 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 Log.e("DevicesViewModel", "P2P client connection failed: ${e.message}", e)
                 withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Connection Failed: ${e.localizedMessage}" }
                 _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P client connection failed: ${e.message}", peerDeviceName = ownerAddress))
+                persistHistory()
                 closeP2pClientSocket()
             } catch (se: SecurityException) {
                 Log.e("DevicesViewModel", "SecurityException during P2P client connection: ${se.message}", se)
                 withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Connection Permission Error" }
                  _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P client connection permission error: ${se.message}", peerDeviceName = ownerAddress))
+                persistHistory()
                 closeP2pClientSocket()
             }
         }
@@ -1169,6 +1208,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             Log.i("DevicesViewModel", "Disconnecting P2P...")
             if (_isRefreshing.value && (p2pClientSocket != null || p2pServerSocket != null) ) { // If a sync was active
                 _syncHistory.add(0, SyncHistoryEntry(folderName = "Active Sync", status = "Error", details = "P2P Disconnected during active sync."))
+                persistHistory()
             }
             p2pServerJob?.cancel()
             p2pServerJob = null
@@ -1258,6 +1298,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             permissionRequestStatus.value = "Error: Not connected for sync."
             val folderNameForHistory = DocumentFile.fromTreeUri(getApplication(), folderUri)?.name ?: folderUri.toString()
             _syncHistory.add(0, SyncHistoryEntry(folderName = folderNameForHistory, status = "Error", details = "Cannot initiate sync: Not connected."))
+            persistHistory()
             return
         }
         val context = getApplication<Application>().applicationContext
@@ -1278,6 +1319,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
             val folderNameForHistory = DocumentFile.fromTreeUri(getApplication(), folderUri)?.name ?: folderUri.toString()
             _syncHistory.add(0, SyncHistoryEntry(folderName = folderNameForHistory, status = "Initiated (Sender)", details = "Sync request initiated for folder."))
+            persistHistory()
 
             val localMetadata = withContext(Dispatchers.IO) {
                 getLocalFileMetadata(folderUri)
@@ -1311,6 +1353,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             Log.e("DevicesViewModel", "Base folder URI is invalid or not a directory: $baseFolderUri")
             sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = syncFolderName, errorMessage = "Source folder not found on sender: $syncFolderName"))
             _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Error", details = "Source folder not found on sender for file $relativePath."))
+            persistHistory()
             return
         }
 
@@ -1322,6 +1365,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 Log.e("DevicesViewModel", "File segment not found: '$segment' in '$relativePath' under URI '$baseFolderUri'")
                 sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = syncFolderName, errorMessage = "File not found on sender: $relativePath"))
                  _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Error", details = "File not found on sender: $relativePath (segment: $segment)."))
+                persistHistory()
                 return
             }
         }
@@ -1330,6 +1374,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             Log.e("DevicesViewModel", "Target DocumentFile is null or not a file for relativePath: $relativePath")
             sendMessage(SyncMessage(MessageType.ERROR_MESSAGE, folderName = syncFolderName, errorMessage = "File not found or is not a file on sender: $relativePath"))
             _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Error", details = "File not found or is not a file on sender: $relativePath."))
+            persistHistory()
             return
         }
 
@@ -1396,6 +1441,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         } else {
             Log.w("DevicesViewModel", "File sending for $relativePath was cancelled, FILE_TRANSFER_END not sent.")
              _syncHistory.add(0, SyncHistoryEntry(folderName = syncFolderName, status = "Cancelled", details = "File sending for $relativePath cancelled, FILE_TRANSFER_END not sent."))
+            persistHistory()
         }
 
         // --- Remove from pending and re-enable sync button if done ---
@@ -1415,6 +1461,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         val context = getApplication<Application>().applicationContext
         permissionRequestStatus.value = "Set '${DocumentFile.fromTreeUri(context,destinationUri)?.name ?: destinationUri}' as destination for syncs named '$folderName'."
         Log.d("DevicesViewModel", "Destination URI for sync folder '$folderName' set to '$destinationUri'. Current map: ${_activeSyncDestinationUris.value}")
+        // --- Also add to ManageFoldersViewModel for future syncs ---
+        manageFoldersViewModel?.addFolder(destinationUri)
     }
 
     fun setDefaultIncomingUri(uri: Uri) {
@@ -1448,6 +1496,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 if (parentDocFile == null || !parentDocFile.isDirectory) {
                     Log.e("DevicesViewModel", "Destination base URI is invalid or not a directory: ${state.destinationBaseUri}")
                      _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "Cannot receive ${state.relativePath}: Destination base URI invalid."))
+                    persistHistory()
                     return
                 }
 
@@ -1462,6 +1511,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         if (childDocFile == null) {
                             Log.e("DevicesViewModel", "Failed to create directory: $segment in ${state.destinationBaseUri}")
                             _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "Cannot receive ${state.relativePath}: Failed to create directory $segment."))
+                            persistHistory()
                             return
                         }
                     }
@@ -1479,6 +1529,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 if (targetDocFile == null || !targetDocFile.canWrite()) {
                     Log.e("DevicesViewModel", "Cannot create or write to target file: ${state.relativePath} in ${state.destinationBaseUri}")
                     _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "Cannot create/write target file: ${state.relativePath}."))
+                    persistHistory()
                     return
                 }
                 // --- Always open in 'w' mode, only once per file ---
@@ -1487,6 +1538,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 if (currentFileOutputStream == null) {
                     Log.e("DevicesViewModel", "Failed to open OutputStream for ${targetDocFile.uri}")
                      _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "Failed to open output stream for ${state.relativePath}."))
+                    persistHistory()
                     return
                 }
                 Log.d("DevicesViewModel", "Receiving to file: ${targetDocFile.uri} (size: ${state.totalSize})")
@@ -1508,12 +1560,14 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             try { currentFileOutputStream?.close() } catch (ioe: IOException) {}
             currentFileOutputStream = null
             _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "IOException writing chunk for ${state.relativePath}: ${e.message}"))
+            persistHistory()
             currentReceivingFile = null
         } catch (e: Exception) {
             Log.e("DevicesViewModel", "Exception writing file chunk for ${state.relativePath}: ${e.message}", e)
             try { currentFileOutputStream?.close() } catch (ioe: IOException) {}
             currentFileOutputStream = null
             _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "Exception writing chunk for ${state.relativePath}: ${e.message}"))
+            persistHistory()
             currentReceivingFile = null
         }
     }
@@ -1533,7 +1587,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "File size mismatch for ${state.relativePath}. Expected ${state.totalSize}, got ${state.bytesReceived}."))
             } else {
                  _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "File Received", details = "File ${state.relativePath} received successfully."))
+                
             }
+            persistHistory()
             // --- Log first 16 bytes of the written file ---
             stateFileUriForDebug?.let { uri ->
                 try {
@@ -1564,6 +1620,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         } catch (e: IOException) {
             Log.e("DevicesViewModel", "IOException finalizing file ${state.relativePath}: ${e.message}", e)
             _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "IOException finalizing file ${state.relativePath}: ${e.message}"))
+            persistHistory()
         } finally {
             currentFileOutputStream = null
             currentReceivingFile = null
@@ -1662,4 +1719,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         // Optionally clear sync history if you want a full UI reset:
         // _syncHistory.clear()
     }
+
+    // --- Reference to ManageFoldersViewModel for folder registration ---
+    private var manageFoldersViewModel: ManageFoldersViewModel? = null
+    fun setManageFoldersViewModel(vm: ManageFoldersViewModel) { manageFoldersViewModel = vm }
 }
