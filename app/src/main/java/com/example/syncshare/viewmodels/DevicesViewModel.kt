@@ -1158,6 +1158,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 persistHistory()
                 closeP2pClientSocket()
             }
+        } else {
+            Log.d("DevicesViewModel", "Receiver was already null.")
         }
     }
 
@@ -1621,10 +1623,34 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "N/A", status = "Error", details = "Failed to send message type ${message.type}: ${e.message}"))
                 }
             }
+            _isRefreshing.value = false
+            checkWifiDirectStatus() // Log current status after reset
         }
     }
 
+    @RequiresPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+    fun forceRequestPeers() {
+        Log.i("DevicesViewModel", "forceRequestPeers() called.")
+        if (wifiP2pManager == null || channel == null) {
+            Log.e("DevicesViewModel", "forceRequestPeers - P2PManager or Channel is null.")
+            permissionRequestStatus.value = "P2P System not ready for peer request."
+            _isRefreshing.value = false
+            return
+        }
+        // Define or reuse your PeerListListener here
+        val peerListListener = WifiP2pManager.PeerListListener { peers ->
+            Log.i("DevicesViewModel", "forceRequestPeers - PeerListListener.onPeersAvailable. System peer list size: ${peers?.deviceList?.size ?: "null"}")
+            onPeersAvailable(peers?.deviceList ?: emptyList())
+        }
+        try {
+            wifiP2pManager?.requestPeers(channel, peerListListener)
+        } catch (e: SecurityException) {
+            Log.e("DevicesViewModel", "SecurityException during forceRequestPeers: ${e.message}", e)
+            permissionRequestStatus.value = "Permission error requesting peers."
+        }
+    }
 
+    
     override fun onCleared() {
         super.onCleared()
         Log.d("DevicesViewModel", "onCleared called.")

@@ -248,6 +248,7 @@ fun DevicesScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
         Text(text = permissionStatus, style = MaterialTheme.typography.bodySmall, modifier = Modifier.fillMaxWidth())
+
         Spacer(modifier = Modifier.height(16.dp))
 
         Box(
@@ -311,6 +312,7 @@ fun DevicesScreen(
     Log.d("DevicesScreen", "DevicesScreen Composable INVOKED - END")
 }
 
+// DeviceItem and getDeviceStatus functions (ensure they are correctly defined as before)
 @Composable
 fun UnifiedDeviceItem(displayableDevice: DisplayableDevice, onClick: () -> Unit) {
     Row(
