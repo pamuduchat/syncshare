@@ -3,23 +3,11 @@ package com.example.syncshare.viewmodels
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Application
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothServerSocket 
 import android.bluetooth.BluetoothSocket
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.net.wifi.p2p.WifiP2pConfig
-import android.net.wifi.p2p.WifiP2pDevice
-import android.net.wifi.p2p.WifiP2pInfo
-import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
-import android.os.Looper
 import android.util.Log
 import androidx.annotation.RequiresPermission
 import androidx.compose.runtime.mutableStateListOf
@@ -29,7 +17,8 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.syncshare.data.SyncHistoryEntry
-import com.example.syncshare.features.WifiDirectBroadcastReceiver
+import com.example.syncshare.management.BluetoothConnectionManager
+import com.example.syncshare.management.WifiDirectManager
 import com.example.syncshare.protocol.FileMetadata
 import com.example.syncshare.protocol.FileTransferInfo
 import com.example.syncshare.protocol.MessageType
@@ -37,7 +26,8 @@ import com.example.syncshare.protocol.SyncMessage
 import com.example.syncshare.ui.model.DeviceTechnology
 import com.example.syncshare.ui.model.DisplayableDevice
 import com.example.syncshare.utils.AppConstants
-import com.example.syncshare.utils.getBluetoothPermissions
+import com.example.syncshare.utils.getBluetoothBondState
+import com.example.syncshare.utils.getDeviceP2pStatusString
 import com.example.syncshare.utils.getWifiDirectPermissions
 import com.example.syncshare.utils.isLocationEnabled
 import kotlinx.coroutines.Dispatchers
@@ -56,10 +46,9 @@ import java.net.ServerSocket
 import java.net.Socket
 import android.webkit.MimeTypeMap
 import android.content.SharedPreferences
+import android.content.Context
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
-import com.example.syncshare.utils.getDeviceP2pStatusString
-import com.example.syncshare.utils.getBluetoothBondState
 import com.example.syncshare.utils.getFailureReasonString
 import com.example.syncshare.utils.getDetailedFailureReasonString
 import com.example.syncshare.utils.computeFileHash
@@ -73,42 +62,24 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     val permissionRequestStatus = mutableStateOf("Idle. Tap a scan button.")
     val displayableDeviceList = mutableStateListOf<DisplayableDevice>()
 
-    private var wifiP2pManager: WifiP2pManager? = null
-    private var p2pChannel: WifiP2pManager.Channel? = null
-    private var p2pBroadcastReceiver: BroadcastReceiver? = null
-    private val p2pIntentFilter = IntentFilter().apply {
-        addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
-        addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
-        addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
-        addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION)
-    }
-    private var p2pDiscoveryRetryCount = 0
-    private val MAX_P2P_DISCOVERY_RETRIES = 3
-    private var p2pDiscoveryTimeoutJob: Job? = null
-    private val P2P_DISCOVERY_TIMEOUT_MS = 20000L
+    // Wi-Fi Direct Manager
+    private val wifiDirectManager = WifiDirectManager(
+        context = application.applicationContext,
+        scope = viewModelScope
+    )
 
-    private val bluetoothManager by lazy {
-        application.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-    }
-    val bluetoothAdapter: BluetoothAdapter? by lazy {
-        bluetoothManager?.adapter
-    }
-    val isBluetoothEnabled = mutableStateOf(false)
-    private var bluetoothScanReceiver: BroadcastReceiver? = null
-    private var btDiscoveryTimeoutJob: Job? = null
-    private val BT_DISCOVERY_TIMEOUT_MS = 15000L
+    // Bluetooth Connection Manager
+    private val bluetoothConnectionManager = BluetoothConnectionManager(
+        context = application.applicationContext,
+        scope = viewModelScope
+    )
 
-    private var connectedBluetoothSocket: BluetoothSocket? = null
-    private val _bluetoothConnectionStatus = MutableStateFlow<String>("Disconnected")
-    val bluetoothConnectionStatus: StateFlow<String> = _bluetoothConnectionStatus
-    private var bluetoothServerJob: Job? = null 
-    private var btServerSocket: BluetoothServerSocket? = null
-
-    private var p2pServerSocket: ServerSocket? = null
-    private var p2pClientSocket: Socket? = null
-    private val _p2pConnectionStatus = MutableStateFlow<String>("Disconnected")
-    val p2pConnectionStatus: StateFlow<String> = _p2pConnectionStatus
-    private var p2pServerJob: Job? = null
+    // Expose P2P connection status from WifiDirectManager
+    val p2pConnectionStatus: StateFlow<String> = wifiDirectManager.connectionStatus
+    
+    // Expose Bluetooth connection status from BluetoothConnectionManager
+    val bluetoothConnectionStatus: StateFlow<String> = bluetoothConnectionManager.connectionStatus
+    val isBluetoothEnabled: StateFlow<Boolean> = bluetoothConnectionManager.isBluetoothEnabled
 
     private val _activeSyncDestinationUris = MutableStateFlow<Map<String, Uri>>(emptyMap())
     private var defaultIncomingFolderUri: Uri? = null
@@ -120,9 +91,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     // --- Pending Folder Mapping for Incoming Syncs ---
     val pendingFolderMapping = mutableStateOf<String?>(null)
     var pendingSyncMessage: SyncMessage? = null
-
-    private val wifiDirectPeersInternal = mutableStateListOf<WifiP2pDevice>()
-    private val bluetoothDevicesInternal = mutableStateListOf<BluetoothDevice>()
 
     private var objectOutputStream: ObjectOutputStream? = null
     private var objectInputStream: ObjectInputStream? = null
@@ -198,574 +166,270 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         Log.d("DevicesViewModel", "DevicesViewModel - INIT BLOCK - START")
-        fullResetP2pConnection() // Always start with a clean P2P state
         loadHistory()
+        
+        // Collect from WifiDirectManager state flows
         viewModelScope.launch {
-            initializeWifiP2p()
-            updateBluetoothState()
+            wifiDirectManager.discoveredPeers.collect { peers ->
+                updateDisplayableDeviceList()
+            }
         }
+        
+        viewModelScope.launch {
+            wifiDirectManager.statusMessage.collect { message ->
+                if (message.contains("P2P") || message.contains("Wi-Fi Direct")) {
+                    permissionRequestStatus.value = message
+                }
+            }
+        }
+        
+        viewModelScope.launch {
+            wifiDirectManager.isScanning.collect { scanning ->
+                if (scanning != _isRefreshing.value && 
+                    (permissionRequestStatus.value.contains("P2P") || 
+                     permissionRequestStatus.value.contains("Wi-Fi Direct"))) {
+                    _isRefreshing.value = scanning
+                }
+            }
+        }
+        
+        // Collect from BluetoothConnectionManager state flows
+        viewModelScope.launch {
+            bluetoothConnectionManager.discoveredDevices.collect { devices ->
+                updateDisplayableDeviceList()
+            }
+        }
+        
+        viewModelScope.launch {
+            bluetoothConnectionManager.statusMessage.collect { message ->
+                if (message.contains("Bluetooth") || message.contains("BT")) {
+                    permissionRequestStatus.value = message
+                }
+            }
+        }
+        
+        viewModelScope.launch {
+            bluetoothConnectionManager.isScanning.collect { scanning ->
+                if (scanning != _isRefreshing.value && 
+                    (permissionRequestStatus.value.contains("Bluetooth") || 
+                     permissionRequestStatus.value.contains("BT"))) {
+                    _isRefreshing.value = scanning
+                }
+            }
+        }
+        
+        viewModelScope.launch {
+            bluetoothConnectionManager.connectedSocket.collect { socket ->
+                if (socket != null) {
+                    // Bluetooth connection established, switch from P2P if needed
+                    if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
+                        Log.d("DevicesViewModel", "Switching from P2P to BT. Closing P2P connection.")
+                        disconnectP2p()
+                    }
+                    // Run socket setup on IO thread to avoid NetworkOnMainThreadException
+                    launch(Dispatchers.IO) {
+                        setupCommunicationStreams(socket, CommunicationTechnology.BLUETOOTH)
+                    }
+                    val peerAddress = socket.remoteDevice?.address ?: "Unknown"
+                    _syncHistory.add(0, SyncHistoryEntry(
+                        folderName = "N/A", 
+                        status = "Connected", 
+                        details = "Bluetooth connection established.", 
+                        peerDeviceName = peerAddress
+                    ))
+                    persistHistory()
+                } else {
+                    // Bluetooth connection lost
+                    if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
+                        closeCommunicationStreams()
+                        currentCommunicationTechnology = null
+                    }
+                }
+            }
+        }
+        
+        viewModelScope.launch {
+            bluetoothConnectionManager.connectedDeviceAddress.collect { deviceAddress ->
+                // Update device list when Bluetooth connection status changes
+                updateDisplayableDeviceList()
+            }
+        }
+        
+        viewModelScope.launch {
+            wifiDirectManager.connectedSocket.collect { socket ->
+                if (socket != null) {
+                    // P2P connection established, switch from Bluetooth if needed
+                    if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
+                        Log.d("DevicesViewModel", "Switching from BT to P2P. Closing BT connection.")
+                        bluetoothConnectionManager.disconnect()
+                    }
+                    // Run socket setup on IO thread to avoid NetworkOnMainThreadException
+                    launch(Dispatchers.IO) {
+                        setupCommunicationStreams(socket, CommunicationTechnology.P2P)
+                    }
+                    val peerAddress = socket.remoteSocketAddress?.toString() ?: "Unknown"
+                    _syncHistory.add(0, SyncHistoryEntry(
+                        folderName = "N/A", 
+                        status = "Connected", 
+                        details = "P2P connection established.", 
+                        peerDeviceName = peerAddress
+                    ))
+                    persistHistory()
+                    // Update device list when connection is established
+                    updateDisplayableDeviceList()
+                } else {
+                    // P2P connection lost
+                    if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
+                        closeCommunicationStreams()
+                        currentCommunicationTechnology = null
+                    }
+                    // Update device list when connection is lost
+                    updateDisplayableDeviceList()
+                }
+            }
+        }
+        
+        viewModelScope.launch {
+            wifiDirectManager.connectedDeviceAddress.collect { deviceAddress ->
+                // Update device list whenever connected device address changes
+                updateDisplayableDeviceList()
+            }
+        }
+        
+        viewModelScope.launch {
+            wifiDirectManager.connectedDeviceAddress.collect { deviceAddress ->
+                // Update device list when connection status changes
+                updateDisplayableDeviceList()
+            }
+        }
+        
+        viewModelScope.launch {
+            wifiDirectManager.connectionStatus.collect { status ->
+                // Update device list when P2P connection status changes
+                updateDisplayableDeviceList()
+            }
+        }
+        
         Log.d("DevicesViewModel", "DevicesViewModel - INIT BLOCK - END")
     }
 
-    fun updateBluetoothState() {
-        isBluetoothEnabled.value = bluetoothAdapter?.isEnabled == true
-        Log.d("DevicesViewModel", "Bluetooth state updated. Enabled: ${isBluetoothEnabled.value}")
-    }
-
-    private fun initializeWifiP2p(isReset: Boolean = false) {
-        Log.i("DevicesViewModel", "initializeWifiP2p() CALLED. Is reset: $isReset")
-        val context = getApplication<Application>().applicationContext
-        wifiP2pManager = context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
-
-        if (wifiP2pManager == null) { Log.e("DevicesViewModel", "P2P_INIT_FAIL: WifiP2pManager is null."); permissionRequestStatus.value = "Error: P2P Service not available."; return }
-        Log.d("DevicesViewModel", "P2P_INIT: WifiP2pManager obtained.")
-
-        try {
-            p2pChannel = wifiP2pManager?.initialize(context, Looper.getMainLooper(), object : WifiP2pManager.ChannelListener {
-                override fun onChannelDisconnected() {
-                    Log.e("DevicesViewModel", "************ P2P CHANNEL DISCONNECTED ************")
-                    this@DevicesViewModel.p2pChannel = null
-                    permissionRequestStatus.value = "P2P Channel Lost! Reset or restart app."
-                    _isRefreshing.value = false; wifiDirectPeersInternal.clear(); updateDisplayableDeviceList()
-                    p2pDiscoveryTimeoutJob?.cancel()
-                }
-            })
-        } catch (e: SecurityException) { Log.e("DevicesViewModel", "SecEx P2P_INIT Channel: ${e.message}", e); permissionRequestStatus.value = "PermErr P2P Init."; return }
-
-        if (p2pChannel == null) {  Log.e("DevicesViewModel", "P2P_INIT_FAIL: Channel is null after initialize."); permissionRequestStatus.value = "Error: P2P Channel failed to init.";  return }
-        Log.d("DevicesViewModel", "P2P_INIT: Channel Initialized: $p2pChannel")
-        if (isReset) {
-            viewModelScope.launch { delay(300); registerP2pReceiver() }
-        }
-    }
-
-    fun registerP2pReceiver() {
-        if (p2pChannel == null) { Log.e("DevicesViewModel", "Cannot reg P2P receiver, channel null."); return }
-        val context = getApplication<Application>().applicationContext
-        if (p2pBroadcastReceiver == null) {
-            p2pBroadcastReceiver = WifiDirectBroadcastReceiver(wifiP2pManager, p2pChannel, this)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) { context.registerReceiver(p2pBroadcastReceiver, p2pIntentFilter, Context.RECEIVER_NOT_EXPORTED) }
-            else { context.registerReceiver(p2pBroadcastReceiver, p2pIntentFilter) }
-            Log.d("DevicesViewModel", "P2P BroadcastReceiver registered.")
-        } else { Log.d("DevicesViewModel", "P2P BroadcastReceiver already registered.") }
-    }
-    fun unregisterP2pReceiver() {
-        p2pDiscoveryTimeoutJob?.cancel()
-        if (p2pBroadcastReceiver != null) {
-            try { getApplication<Application>().applicationContext.unregisterReceiver(p2pBroadcastReceiver); Log.d("DevicesViewModel", "P2P BroadcastReceiver unregistered.") }
-            catch (e: IllegalArgumentException) { Log.w("DevicesViewModel", "Error unreg P2P receiver: ${e.message}") }
-            finally { p2pBroadcastReceiver = null }
-        } else { Log.d("DevicesViewModel", "P2P Receiver already null.")}
-    }
-
-    fun onP2pPeersAvailable(peers: Collection<WifiP2pDevice>) {
-        wifiDirectPeersInternal.clear()
-        wifiDirectPeersInternal.addAll(peers)
-        updateDisplayableDeviceList()
-        if (peers.isEmpty()) {
-            permissionRequestStatus.value = "No Wi-Fi Direct peers found."
-        } else {
-            permissionRequestStatus.value = "${peers.size} Wi-Fi Direct peer(s) found."
-        }
-        _isRefreshing.value = false
-    }
-
+    // P2P Methods - Delegated to WifiDirectManager
     @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
-    fun startP2pDiscovery(isRetry: Boolean = false) {
-        if (!isRetry) {
-            p2pDiscoveryRetryCount = 0
-            bluetoothDevicesInternal.clear() // Clear other tech results
-            updateDisplayableDeviceList()
-        }
-        Log.i("DevicesViewModel", "startP2pDiscovery() - IsRetry: $isRetry, Count: $p2pDiscoveryRetryCount")
-        val context = getApplication<Application>().applicationContext
-        if (wifiP2pManager == null || p2pChannel == null) { Log.e("DevicesViewModel", "startP2pDisc - P2PManager/Channel null"); _isRefreshing.value = false; return }
-        if (!getWifiDirectPermissions().all { ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }) { Log.e("DevicesViewModel", "startP2pDisc - Perms missing"); _isRefreshing.value = false; return }
-
-        _isRefreshing.value = true
-        if (!isRetry) permissionRequestStatus.value = "Stopping previous P2P discovery..."
-
-        // Create a timeout job for stopping discovery
-        val stopTimeoutJob = viewModelScope.launch {
-            delay(5000) // 5 second timeout for stopping discovery
-            if (_isRefreshing.value && permissionRequestStatus.value.contains("Stopping previous P2P discovery")) {
-                Log.w("DevicesViewModel", "Timeout waiting for stopPeerDiscovery to complete. Proceeding with new discovery.")
-                initiateActualP2pDiscoveryAfterStop()
-            }
-        }
-
-        try {
-            wifiP2pManager?.stopPeerDiscovery(p2pChannel, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { 
-                    Log.i("DevicesViewModel", "stopP2pDiscovery.onSuccess()")
-                    stopTimeoutJob.cancel()
-                    if (!isRetry) permissionRequestStatus.value = "Preparing P2P discovery..."
-                    initiateActualP2pDiscoveryAfterStop() 
-                }
-                override fun onFailure(reasonCode: Int) { 
-                    val r = getFailureReasonString(reasonCode)
-                    Log.w("DevicesViewModel", "stopP2pDiscovery.onFailure - $r ($reasonCode)")
-                    stopTimeoutJob.cancel()
-                    if (!isRetry) permissionRequestStatus.value = "Stop P2P warn ($r)"
-                    initiateActualP2pDiscoveryAfterStop() 
-                }
-            })
-        } catch (e: SecurityException) { 
-            Log.e("DevicesViewModel", "SecEx stopP2pDisc: ${e.message}", e)
-            stopTimeoutJob.cancel()
-            if (!isRetry) permissionRequestStatus.value = "PermErr stopP2PDisc"
-            initiateActualP2pDiscoveryAfterStop() 
-        }
-        catch (e: Exception) { 
-            Log.e("DevicesViewModel", "GenEx stopP2pDisc: ${e.message}", e)
-            stopTimeoutJob.cancel()
-            if (!isRetry) permissionRequestStatus.value = "Err stopP2PDisc"
-            initiateActualP2pDiscoveryAfterStop()
-        }
-    }
-
-    @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
-    private fun initiateActualP2pDiscoveryAfterStop() {
-        Log.d("DevicesViewModel", "initiateActualP2pDiscoveryAfterStop() - Retry: $p2pDiscoveryRetryCount")
-        if (p2pChannel == null) { Log.e("DevicesViewModel", "initActualP2pDisc - Channel null"); _isRefreshing.value = false; p2pDiscoveryRetryCount = 0; checkWifiDirectStatus(); return }
-
-        permissionRequestStatus.value = "Starting P2P discovery${if (p2pDiscoveryRetryCount > 0) " (attempt ${p2pDiscoveryRetryCount + 1})" else ""}..."
-        try {
-            wifiP2pManager?.discoverPeers(p2pChannel, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {
-                    Log.i("DevicesViewModel", "discoverP2pPeers.onSuccess - INITIATED")
-                    permissionRequestStatus.value = "P2P Discovery process started..."
-                    p2pDiscoveryRetryCount = 0
-                    p2pDiscoveryTimeoutJob?.cancel()
-                    p2pDiscoveryTimeoutJob = viewModelScope.launch {
-                        delay(P2P_DISCOVERY_TIMEOUT_MS)
-                        if (_isRefreshing.value && permissionRequestStatus.value.startsWith("P2P Discovery process started")) {
-                            Log.w("DevicesViewModel", "P2P Discovery timed out after ${P2P_DISCOVERY_TIMEOUT_MS}ms.")
-                            permissionRequestStatus.value = "P2P Discovery timed out. No devices found."
-                            _isRefreshing.value = false; wifiDirectPeersInternal.clear(); updateDisplayableDeviceList()
-                            try { wifiP2pManager?.stopPeerDiscovery(p2pChannel, null) } catch (e: Exception) {}
-                        }
-                    }
-                }
-                override fun onFailure(reasonCode: Int) {
-                    val dr = getDetailedFailureReasonString(reasonCode); Log.e("DevicesViewModel", "discoverP2pPeers.onFailure - FAILED: $dr ($reasonCode)")
-                    p2pDiscoveryTimeoutJob?.cancel()
-                    if (p2pDiscoveryRetryCount < MAX_P2P_DISCOVERY_RETRIES) {
-                        p2pDiscoveryRetryCount++; val d = 300L * (1 shl (p2pDiscoveryRetryCount -1)); Log.d("DevicesViewModel", "P2P Retry in ${d}ms ($p2pDiscoveryRetryCount/$MAX_P2P_DISCOVERY_RETRIES)"); permissionRequestStatus.value = "P2P Disc. failed. Retrying ${d/1000.0}s"
-                        viewModelScope.launch { delay(d); startP2pDiscovery(isRetry = true) }
-                    } else { Log.e("DevicesViewModel", "P2P Disc. GIVING UP after $MAX_P2P_DISCOVERY_RETRIES retries. Reason: $dr"); permissionRequestStatus.value = "P2P Disc. Failed: $dr"; _isRefreshing.value = false; p2pDiscoveryRetryCount = 0; checkWifiDirectStatus() }
-                }
-            })
-        } catch (e: SecurityException) { Log.e("DevicesViewModel", "SecEx discoverP2pPeers: ${e.message}", e); permissionRequestStatus.value = "PermErr P2P Disc."; _isRefreshing.value = false; p2pDiscoveryRetryCount = 0; checkWifiDirectStatus(); p2pDiscoveryTimeoutJob?.cancel() }
-    }
-
-
-    @SuppressLint("MissingPermission")
-    fun connectToP2pDevice(device: WifiP2pDevice) {
-        Log.i("DevicesViewModel", "connectToP2pDevice: ${device.deviceName} (status: ${device.status})")
-        if (wifiP2pManager == null || p2pChannel == null) {
-            Log.e("DevicesViewModel", "Cannot connect P2P: Manager/Channel null.")
-            permissionRequestStatus.value = "P2P Connect Error: Service not ready."
-            return
-        }
-        val context = getApplication<Application>().applicationContext
-        if (!getWifiDirectPermissions().all { ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }) {
-            Log.e("DevicesViewModel", "connectToP2pDevice - Missing P2P permissions.")
-            permissionRequestStatus.value = "P2P perm needed for connect."
-            return
-        }
-
-        // Only connect if device is AVAILABLE
-        if (device.status != WifiP2pDevice.AVAILABLE) {
-            Log.w("DevicesViewModel", "Device ${device.deviceName} is not AVAILABLE (status: ${getDeviceP2pStatusString(device.status)}), skipping connect.")
-            permissionRequestStatus.value = "Device is not available for connection."
-            return
-        }
-
-        val config = WifiP2pConfig().apply {
-            deviceAddress = device.deviceAddress
-        }
-
-        try {
-            wifiP2pManager?.connect(p2pChannel, config, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {
-                    Log.i("DevicesViewModel", "P2P Connect INITIATION to ${device.deviceName} SUCCEEDED.")
-                    permissionRequestStatus.value = "P2P Connecting to ${device.deviceName}..."
-                }
-                override fun onFailure(reasonCode: Int) {
-                    val r = getDetailedFailureReasonString(reasonCode)
-                    Log.e("DevicesViewModel", "P2P Connect INITIATION FAILED to ${device.deviceName}. Reason: $r ($reasonCode)")
-                    permissionRequestStatus.value = "P2P Connect Failed: $r"
-                    // Restart discovery on failure
-                    startP2pDiscovery()
-                }
-            })
-        } catch (e: SecurityException) {
-            Log.e("DevicesViewModel", "SecEx P2P connect: ${e.message}", e)
-            permissionRequestStatus.value = "PermErr P2P connect."
-        } catch (e: Exception) {
-            Log.e("DevicesViewModel", "Unexpected error during P2P connect: ${e.message}", e)
-            permissionRequestStatus.value = "P2P Connect Error: ${e.message}"
-        }
-    }
-
-
-    // --- Bluetooth Methods ---
-    @SuppressLint("MissingPermission")
-    fun startBluetoothDiscovery() {
-        Log.i("DevicesViewModel", "startBluetoothDiscovery() - ENTRY")
-        updateBluetoothState()
-        if (bluetoothAdapter == null) { _isRefreshing.value = false; permissionRequestStatus.value = "Bluetooth not supported."; return }
-        if (!isBluetoothEnabled.value) { _isRefreshing.value = false; permissionRequestStatus.value = "Bluetooth is OFF."; return }
-
-        val context = getApplication<Application>().applicationContext
-        if (!isLocationEnabled(context)) {
-            Log.w("DevicesViewModel", "BT_DISC_FAIL: System Location Services are OFF.")
-            permissionRequestStatus.value = "Location Services OFF. Enable for BT discovery."
-            _isRefreshing.value = false; return
-        }
-        if (!getBluetoothPermissions().all { ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }) {
-            Log.e("DevicesViewModel", "BT_DISC_FAIL: Missing BT permissions."); permissionRequestStatus.value = "Bluetooth permissions needed."; _isRefreshing.value = false; return
-        }
-        Log.d("DevicesViewModel", "BT_DISC: All necessary Bluetooth permissions granted.")
-
-        if (bluetoothAdapter?.isDiscovering == true) {
-            Log.d("DevicesViewModel", "BT_DISC: Already discovering. Cancelling first.")
-            try { bluetoothAdapter?.cancelDiscovery() } catch (e: SecurityException) {Log.e("DevicesViewModel", "SecEx BT cancelDiscovery (isDiscovering): ${e.message}", e)}
-        }
-
-        bluetoothDevicesInternal.clear()
-        wifiDirectPeersInternal.clear() // Clear P2P results
+    fun startP2pDiscovery() {
         updateDisplayableDeviceList()
-
-        _isRefreshing.value = true
-        permissionRequestStatus.value = "Scanning for Bluetooth devices..."
-
-        if (bluetoothScanReceiver == null) {
-            bluetoothScanReceiver = object : BroadcastReceiver() {
-                @SuppressLint("MissingPermission")
-                override fun onReceive(context: Context, intent: Intent) {
-                    val action: String? = intent.action; Log.d("BTScanReceiver", "onReceive: action=$action")
-                    when (action) {
-                        BluetoothDevice.ACTION_FOUND -> {
-                            val device: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) { intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java) } else { @Suppress("DEPRECATION") intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE) }
-                            device?.let { Log.d("BTScanReceiver", "ACTION_FOUND: Raw Name: ${try{it.name}catch(e:SecurityException){"N/A (SecEx)"} ?: "No Name"}, Address: ${it.address}"); handleBluetoothDeviceFound(it) } ?: Log.w("BTScanReceiver", "ACTION_FOUND: Device is null")
-                        }
-                        BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> { Log.d("BTScanReceiver", "ACTION_DISCOVERY_FINISHED"); handleBluetoothDiscoveryFinished() }
-                        BluetoothAdapter.ACTION_STATE_CHANGED -> {
-                            val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
-                            val oldState = isBluetoothEnabled.value; isBluetoothEnabled.value = state == BluetoothAdapter.STATE_ON
-                            Log.d("BTScanReceiver", "ACTION_STATE_CHANGED: Bluetooth state $oldState -> ${isBluetoothEnabled.value}")
-                            if (state == BluetoothAdapter.STATE_OFF && _isRefreshing.value && permissionRequestStatus.value.contains("Bluetooth")) {
-                                _isRefreshing.value = false; permissionRequestStatus.value = "Bluetooth turned off during scan."
-                                bluetoothDevicesInternal.clear(); updateDisplayableDeviceList(); stopBluetoothDiscovery()
-                            }
-                        }
-                    }
-                }
-            }
-            val filter = IntentFilter().apply { addAction(BluetoothDevice.ACTION_FOUND); addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED); addAction(BluetoothAdapter.ACTION_STATE_CHANGED) }
-            try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) { context.registerReceiver(bluetoothScanReceiver, filter, Context.RECEIVER_NOT_EXPORTED) }
-                else { context.registerReceiver(bluetoothScanReceiver, filter) }
-                Log.d("DevicesViewModel", "Bluetooth Scan Receiver registered.")
-            } catch (e: Exception) { Log.e("DevicesViewModel", "Error registering BT Scan Receiver: ${e.message}", e); _isRefreshing.value = false; permissionRequestStatus.value = "Error setting up BT scan."; return }
-        }
-
-        try {
-            if (bluetoothAdapter?.startDiscovery() == false) {
-                Log.e("DevicesViewModel", "BT_DISC_FAIL: startDiscovery() returned false.")
-                _isRefreshing.value = false; permissionRequestStatus.value = "Failed to start BT scan (denied)."
-                stopBluetoothDiscovery()
-            } else {
-                Log.i("DevicesViewModel", "BT_DISC: Discovery request sent to BluetoothAdapter.")
-                btDiscoveryTimeoutJob?.cancel()
-                btDiscoveryTimeoutJob = viewModelScope.launch {
-                    delay(BT_DISCOVERY_TIMEOUT_MS)
-                    if (isActive && _isRefreshing.value && permissionRequestStatus.value.startsWith("Scanning for Bluetooth")) {
-                        Log.w("DevicesViewModel", "Bluetooth Discovery timed out after ${BT_DISCOVERY_TIMEOUT_MS}ms.")
-                        permissionRequestStatus.value = "Bluetooth scan timed out."
-                        stopBluetoothDiscovery()
-                    }
-                }
-            }
-        } catch (e: SecurityException) { Log.e("DevicesViewModel", "SecEx BT startDiscovery: ${e.message}", e); _isRefreshing.value = false; permissionRequestStatus.value = "PermErr starting BT scan."; stopBluetoothDiscovery() }
+        wifiDirectManager.startDiscovery()
     }
 
-    @SuppressLint("MissingPermission")
-    fun stopBluetoothDiscovery() {
-        Log.d("DevicesViewModel", "stopBluetoothDiscovery() called.")
-        btDiscoveryTimeoutJob?.cancel()
-        if (bluetoothAdapter?.isDiscovering == true) {
-            try { bluetoothAdapter?.cancelDiscovery() } catch (e: SecurityException) { Log.e("DevicesViewModel", "SecEx BT cancelDiscovery: ${e.message}", e)}
-            Log.d("DevicesViewModel", "Bluetooth discovery explicit stop/cancel initiated.")
-        }
-        if (bluetoothScanReceiver != null) {
-            try { getApplication<Application>().applicationContext.unregisterReceiver(bluetoothScanReceiver); Log.d("DevicesViewModel", "Bluetooth scan receiver unregistered.") }
-            catch (e: IllegalArgumentException) { Log.w("DevicesViewModel", "Error unreg BT receiver: ${e.message}") }
-            finally { bluetoothScanReceiver = null }
-        }
-        if (_isRefreshing.value && (permissionRequestStatus.value.contains("Bluetooth") || permissionRequestStatus.value.contains("Scanning for Bluetooth"))) {
-            _isRefreshing.value = false
-            if (permissionRequestStatus.value.startsWith("Scanning for Bluetooth")) {
-                permissionRequestStatus.value = "Bluetooth scan stopped."
-            }
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun handleBluetoothDiscoveryFinished() {
-        Log.i("DevicesViewModel", "BT_DISC_FINISHED (received from broadcast).")
-        btDiscoveryTimeoutJob?.cancel()
-        if (_isRefreshing.value && permissionRequestStatus.value.contains("Bluetooth")) {
-            _isRefreshing.value = false
-        }
-        val btDeviceCountInDisplayList = displayableDeviceList.count { it.technology == DeviceTechnology.BLUETOOTH_CLASSIC }
-        if (btDeviceCountInDisplayList == 0 && permissionRequestStatus.value.startsWith("Scanning for Bluetooth")) {
-            permissionRequestStatus.value = "No new Bluetooth devices found."
-        } else if (btDeviceCountInDisplayList > 0 && (permissionRequestStatus.value.contains("Bluetooth") || permissionRequestStatus.value.startsWith("Scanning for Bluetooth"))) {
-            permissionRequestStatus.value = "$btDeviceCountInDisplayList Bluetooth device(s) found."
+    fun connectToP2pDevice(device: com.example.syncshare.ui.model.DisplayableDevice) {
+        val p2pDevice = device.originalDeviceObject as? android.net.wifi.p2p.WifiP2pDevice
+        if (p2pDevice != null) {
+            wifiDirectManager.connectToDevice(p2pDevice)
         } else {
-            if (permissionRequestStatus.value.startsWith("Scanning for Bluetooth")) {
-                permissionRequestStatus.value = "Bluetooth scan complete."
-            }
+            Log.e("DevicesViewModel", "Cannot connect: Device is not a WifiP2pDevice")
         }
     }
 
-    @SuppressLint("MissingPermission")
-    fun connectToBluetoothDevice(device: BluetoothDevice) {
-        val deviceNameForLog = try { device.name } catch(e: SecurityException){ null } ?: device.address
-        Log.i("DevicesViewModel", "connectToBluetoothDevice called for: $deviceNameForLog")
+    fun resetWifiDirectSystem() = wifiDirectManager.resetWifiDirectSystem()
+    
+    fun checkWifiDirectStatus(): String = wifiDirectManager.checkWifiDirectStatus()
+    
+    @RequiresPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+    fun forceRequestPeers() = wifiDirectManager.forceRequestPeers()
+    
+    fun fullResetP2pConnection() = wifiDirectManager.fullReset()
 
-        if (bluetoothAdapter?.isDiscovering == true) {
-            Log.d("DevicesViewModel", "connectToBT - Cancelling discovery before connecting.")
-            try { bluetoothAdapter?.cancelDiscovery() } catch (e: SecurityException) { Log.e("DevicesViewModel", "SecEx BT cancelDisc for connect: ${e.message}", e) }
-        }
-        val context = getApplication<Application>().applicationContext
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-            Log.e("DevicesViewModel", "connectToBT - Missing BLUETOOTH_CONNECT permission."); permissionRequestStatus.value = "BT Connect permission needed."; _bluetoothConnectionStatus.value = "Error: Permission Missing"; return
-        } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S && ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH) != PackageManager.PERMISSION_GRANTED) {
-            Log.e("DevicesViewModel", "connectToBT - Missing BLUETOOTH permission for connect (API <31)."); permissionRequestStatus.value = "BT permission needed."; _bluetoothConnectionStatus.value = "Error: Permission Missing"; return
-        }
+    // --- Bluetooth Methods - Delegated to BluetoothConnectionManager ---
+    fun startBluetoothDiscovery() = bluetoothConnectionManager.startDiscovery()
+    
+    fun stopBluetoothDiscovery() = bluetoothConnectionManager.stopDiscovery()
 
-        permissionRequestStatus.value = "Connecting to BT: $deviceNameForLog..."
-        _isRefreshing.value = true; _bluetoothConnectionStatus.value = "Connecting..."
+    fun connectToBluetoothDevice(device: BluetoothDevice) = bluetoothConnectionManager.connectToDevice(device)
 
-        viewModelScope.launch(Dispatchers.IO) {
-            var socket: BluetoothSocket? = null
-            try {
-                Log.d("DevicesViewModel", "Creating RFCOMM socket to service with UUID: ${AppConstants.BLUETOOTH_SERVICE_UUID}")
-                socket = device.createRfcommSocketToServiceRecord(AppConstants.BLUETOOTH_SERVICE_UUID)
-                Log.d("DevicesViewModel", "Attempting to connect socket...")
-                socket.connect()
-                Log.i("DevicesViewModel", "Bluetooth connection established with $deviceNameForLog")
-                connectedBluetoothSocket = socket
-                launch(Dispatchers.Main) {
-                    _isRefreshing.value = false; permissionRequestStatus.value = "Connected via BT to $deviceNameForLog"; _bluetoothConnectionStatus.value = "Connected to $deviceNameForLog"
-                    setupCommunicationStreams(socket, CommunicationTechnology.BLUETOOTH)
-                }
-            } catch (e: IOException) {
-                Log.e("DevicesViewModel", "Bluetooth connection failed for $deviceNameForLog: ${e.message}", e)
-                launch(Dispatchers.Main) { _isRefreshing.value = false; permissionRequestStatus.value = "BT Connection Failed: ${e.localizedMessage}"; _bluetoothConnectionStatus.value = "Connection Failed" }
-                try { socket?.close() } catch (closeException: IOException) { Log.e("DevicesViewModel", "Could not close client socket post-failure", closeException) }
-            } catch (se: SecurityException) {
-                Log.e("DevicesViewModel", "SecurityException during BT connection: ${se.message}", se)
-                launch(Dispatchers.Main) { _isRefreshing.value = false; permissionRequestStatus.value = "BT Connection Permission Error"; _bluetoothConnectionStatus.value = "Error: Permission Denied" }
-            }
-        }
-    }
+    fun disconnectBluetooth() = bluetoothConnectionManager.disconnect()
 
-    fun disconnectBluetooth() {
-        viewModelScope.launch(Dispatchers.IO) {
-            if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
-                closeCommunicationStreams()
-            } else {
-                try { connectedBluetoothSocket?.close() }
-                catch (e: IOException) { Log.e("DevicesViewModel", "Could not close connected Bluetooth socket during disconnectBluetooth: ${e.message}") }
-            }
-            connectedBluetoothSocket = null
-            launch(Dispatchers.Main) { _bluetoothConnectionStatus.value = "Disconnected" }
-            Log.i("DevicesViewModel", "Bluetooth disconnected.")
-        }
-    }
+    fun startBluetoothServer() = bluetoothConnectionManager.startServer()
 
+    fun stopBluetoothServer() = bluetoothConnectionManager.stopServer()
 
-    // --- Bluetooth Server Methods ---
-    @SuppressLint("MissingPermission")
-    fun startBluetoothServer() {
-        if (bluetoothServerJob?.isActive == true) { Log.d("DevicesViewModel", "BT server job already active."); return }
-        if (bluetoothAdapter == null || !isBluetoothEnabled.value) { Log.e("DevicesViewModel", "Cannot start BT server: Adapter null or BT disabled."); permissionRequestStatus.value = "Cannot start BT server: BT not ready."; return }
-
-        val context = getApplication<Application>().applicationContext
-        val connectPerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Manifest.permission.BLUETOOTH_CONNECT else Manifest.permission.BLUETOOTH
-        if (ActivityCompat.checkSelfPermission(context, connectPerm) != PackageManager.PERMISSION_GRANTED) {
-            Log.e("DevicesViewModel", "Missing $connectPerm permission for BT server."); permissionRequestStatus.value = "BT Connect perm needed for server."; return
-        }
-
-        bluetoothServerJob = viewModelScope.launch(Dispatchers.IO) {
-            Log.i("DevicesViewModel", "Starting Bluetooth server thread...")
-            permissionRequestStatus.value = "Bluetooth server starting..."
-            var tempSocket: BluetoothSocket?
-            try {
-                btServerSocket = bluetoothAdapter?.listenUsingRfcommWithServiceRecord(AppConstants.BLUETOOTH_SERVICE_NAME, AppConstants.BLUETOOTH_SERVICE_UUID)
-                Log.d("DevicesViewModel", "BT ServerSocket listening with UUID: ${AppConstants.BLUETOOTH_SERVICE_UUID}")
-                while (isActive) {
-                    try {
-                        Log.d("DevicesViewModel", "BT server calling btServerSocket.accept()...")
-                        tempSocket = btServerSocket?.accept()
-                    } catch (e: IOException) {
-                        if (isActive) { Log.e("DevicesViewModel", "BT server socket accept() failed or closed.", e) }
-                        else { Log.d("DevicesViewModel", "BT server socket accept() interrupted by cancellation.")}
-                        break
-                    }
-                    tempSocket?.let { socket ->
-                        val remoteDeviceName = try {socket.remoteDevice.name} catch(e:SecurityException){null} ?: socket.remoteDevice.address
-                        Log.i("DevicesViewModel", "BT connection accepted from: $remoteDeviceName")
-                        handleAcceptedBluetoothConnection(socket)
-                    }
-                }
-            } catch (e: IOException) { Log.e("DevicesViewModel", "BT server listenUsingRfcomm failed", e); launch(Dispatchers.Main) { permissionRequestStatus.value = "BT Server Error: ${e.message}" } }
-            catch (se: SecurityException) { Log.e("DevicesViewModel", "SecEx starting BT server: ${se.message}", se); launch(Dispatchers.Main) { permissionRequestStatus.value = "BT Server Permission Error" } }
-            finally {
-                Log.d("DevicesViewModel", "Bluetooth server thread ending.")
-                try { btServerSocket?.close() } catch (e: IOException) { Log.e("DevicesViewModel", "Could not close BT server socket on exit: ${e.message}") }
-                btServerSocket = null
-            }
-        }
-    }
-
-    fun stopBluetoothServer() {
-        Log.i("DevicesViewModel", "Stopping Bluetooth server...")
-        bluetoothServerJob?.cancel()
-        bluetoothServerJob = null
-        permissionRequestStatus.value = "Bluetooth server stopped."
-    }
-
-    fun prepareBluetoothService() {
-        updateBluetoothState()
-        if (isBluetoothEnabled.value) {
-            val context = getApplication<Application>().applicationContext
-            val connectPerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Manifest.permission.BLUETOOTH_CONNECT else Manifest.permission.BLUETOOTH
-            if (ActivityCompat.checkSelfPermission(context, connectPerm) == PackageManager.PERMISSION_GRANTED) {
-                startBluetoothServer()
-            } else {
-                Log.w("DevicesViewModel", "BT_PREPARE: Missing $connectPerm. BT Server not started.")
-            }
-        } else {
-            Log.w("DevicesViewModel", "BT_PREPARE: Bluetooth not enabled, cannot start server.")
-        }
-    }
+    fun prepareBluetoothService() = bluetoothConnectionManager.prepareService()
 
 
     // --- Unified List & Helpers ---
     @SuppressLint("MissingPermission")
-    private fun handleBluetoothDeviceFound(device: BluetoothDevice) {
-        val context = getApplication<Application>().applicationContext
-        var deviceName: String? = "Unknown BT Device"
-        var canGetName = false
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) canGetName = true
-            else deviceName = "Name N/A (No CONNECT Perm)"
-        } else {
-            if (ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH) == PackageManager.PERMISSION_GRANTED) canGetName = true
-            else deviceName = "Name N/A (No BT Perm)"
-        }
-        if (canGetName) {
-            deviceName = try {
-                device.name
-            } catch (se: SecurityException) {
-                "Name N/A (SecEx)"
-            }
-        }
-
-        if (!bluetoothDevicesInternal.any { it.address == device.address }) {
-            Log.d("DevicesViewModel", "BT_DEVICE_ADDED_TO_INTERNAL_LIST: ${deviceName ?: "(Unnamed)"} - ${device.address}")
-            bluetoothDevicesInternal.add(device); updateDisplayableDeviceList()
-        }
-    }
-
-    @SuppressLint("MissingPermission")
     private fun updateDisplayableDeviceList() {
-        Log.d("DevicesViewModel", "updateDisplayableDeviceList. P2P(int): ${wifiDirectPeersInternal.size}, BT(int): ${bluetoothDevicesInternal.size}")
+        val p2pPeers = wifiDirectManager.discoveredPeers.value
+        val connectedP2pDeviceAddress = wifiDirectManager.connectedDeviceAddress.value
+        val bluetoothDevices = bluetoothConnectionManager.discoveredDevices.value
+        val connectedBluetoothDeviceAddress = bluetoothConnectionManager.connectedDeviceAddress.value
+        
+        Log.d("DevicesViewModel", "updateDisplayableDeviceList. P2P(manager): ${p2pPeers.size}, BT(manager): ${bluetoothDevices.size}, Connected P2P: $connectedP2pDeviceAddress, Connected BT: $connectedBluetoothDeviceAddress")
+        
         val newList = mutableListOf<DisplayableDevice>()
         val context = getApplication<Application>().applicationContext
         var btConnectPermGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.S || ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
 
-        wifiDirectPeersInternal.forEach { p2pDevice ->
-            newList.add(DisplayableDevice(id = p2pDevice.deviceAddress ?: "p2p_${p2pDevice.hashCode()}", name = p2pDevice.deviceName ?: "Unknown P2P Device", details = "Wi-Fi P2P - ${getDeviceP2pStatusString(p2pDevice.status)}", technology = DeviceTechnology.WIFI_DIRECT, originalDeviceObject = p2pDevice))
+        p2pPeers.forEach { p2pDevice ->
+            // Check if this device is currently connected
+            val isConnected = connectedP2pDeviceAddress != null && p2pDevice.deviceAddress == connectedP2pDeviceAddress
+            val statusText = if (isConnected) "Connected" else getDeviceP2pStatusString(p2pDevice.status)
+            
+            Log.d("DevicesViewModel", "P2P Device: ${p2pDevice.deviceName} (${p2pDevice.deviceAddress}) - Status: $statusText, Connected to: $connectedP2pDeviceAddress, isConnected: $isConnected")
+            
+            newList.add(DisplayableDevice(
+                id = p2pDevice.deviceAddress ?: "p2p_${p2pDevice.hashCode()}", 
+                name = p2pDevice.deviceName ?: "Unknown P2P Device", 
+                details = "Wi-Fi P2P - $statusText", 
+                technology = DeviceTechnology.WIFI_DIRECT, 
+                originalDeviceObject = p2pDevice
+            ))
         }
-        bluetoothDevicesInternal.forEach { btDevice ->
+        
+        bluetoothDevices.forEach { btDevice ->
             var deviceNameStr: String? = "Unknown BT Device"
             var bondStateInt = BluetoothDevice.BOND_NONE
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    if (btConnectPermGranted) { deviceNameStr = btDevice.name; bondStateInt = btDevice.bondState } else { deviceNameStr = "Name N/A (No CONNECT)" }
+                    if (btConnectPermGranted) { 
+                        deviceNameStr = btDevice.name
+                        bondStateInt = btDevice.bondState 
+                    } else { 
+                        deviceNameStr = "Name N/A (No CONNECT)" 
+                    }
                 } else {
-                    if (ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH) == PackageManager.PERMISSION_GRANTED) { deviceNameStr = btDevice.name; bondStateInt = btDevice.bondState } else { deviceNameStr = "Name N/A (No BT Perm)" }
+                    if (ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH) == PackageManager.PERMISSION_GRANTED) { 
+                        deviceNameStr = btDevice.name
+                        bondStateInt = btDevice.bondState 
+                    } else { 
+                        deviceNameStr = "Name N/A (No BT Perm)" 
+                    }
                 }
-            } catch (e: SecurityException) { deviceNameStr = "Name N/A (SecEx)"}
+            } catch (e: SecurityException) { 
+                deviceNameStr = "Name N/A (SecEx)"
+            }
 
-            newList.add(DisplayableDevice(id = btDevice.address, name = deviceNameStr ?: "Unknown BT Device", details = "Bluetooth - Paired: ${getBluetoothBondState(bondStateInt)}", technology = DeviceTechnology.BLUETOOTH_CLASSIC, originalDeviceObject = btDevice))
+            // Check if this Bluetooth device is currently connected
+            val isConnected = connectedBluetoothDeviceAddress != null && btDevice.address == connectedBluetoothDeviceAddress
+            val connectionText = if (isConnected) "Connected" else "Paired: ${getBluetoothBondState(bondStateInt)}"
+            
+            Log.d("DevicesViewModel", "BT Device: ${deviceNameStr} (${btDevice.address}) - Connection: $connectionText, Connected to: $connectedBluetoothDeviceAddress, isConnected: $isConnected")
+
+            newList.add(DisplayableDevice(
+                id = btDevice.address, 
+                name = deviceNameStr ?: "Unknown BT Device", 
+                details = "Bluetooth - $connectionText", 
+                technology = DeviceTechnology.BLUETOOTH_CLASSIC, 
+                originalDeviceObject = btDevice
+            ))
         }
+        
         displayableDeviceList.clear()
         displayableDeviceList.addAll(newList.distinctBy { it.id })
         Log.d("DevicesViewModel", "Updated displayableDeviceList. Size: ${displayableDeviceList.size}")
     }
 
-    fun resetWifiDirectSystem() {
-        Log.i("DevicesViewModel", "resetWifiDirectSystem CALLED")
-        permissionRequestStatus.value = "Resetting Wi-Fi Direct..."
-        _isRefreshing.value = true
-        p2pDiscoveryTimeoutJob?.cancel()
+    // Rest of the methods are implemented in WifiDirectManager
 
-        try {
-            if (p2pChannel != null && wifiP2pManager != null) {
-                wifiP2pManager?.stopPeerDiscovery(p2pChannel, null)
-            }
-        } catch (e: SecurityException) { Log.w("DevicesViewModel", "SecEx stopP2PDisc during reset: ${e.message}", e)}
-        catch (e: Exception) { Log.w("DevicesViewModel", "Ex stopP2PDisc during reset: ${e.message}")}
-        unregisterP2pReceiver()
-        p2pChannel = null; wifiDirectPeersInternal.clear(); updateDisplayableDeviceList()
-        viewModelScope.launch {
-            delay(500); initializeWifiP2p(isReset = true); delay(300)
-            permissionRequestStatus.value = if (p2pChannel != null) "P2P Reset complete. Try discovery." else "P2P Reset failed to re-init channel."
-            _isRefreshing.value = false; checkWifiDirectStatus()
-        }
-    }
-    fun checkWifiDirectStatus(): String {
-        Log.i("DevicesViewModel", "checkWifiDirectStatus CALLED")
-        val context = getApplication<Application>().applicationContext
-        val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
-        val isWifiEnabled = wifiManager?.isWifiEnabled == true
-        val systemLocationEnabled = isLocationEnabled(context)
-
-        val diagnosticInfo = StringBuilder().apply {
-            append("P2P Diagnostics:\n")
-            append("- Wi-Fi Enabled: $isWifiEnabled\n")
-            append("- System Location Enabled: $systemLocationEnabled\n")
-            append("- P2P Manager: ${if (wifiP2pManager != null) "OK" else "NULL"}\n")
-            append("- P2P Channel: ${if (p2pChannel != null) "OK" else "NULL"}\n")
-            append("- P2P Receiver: ${if (p2pBroadcastReceiver != null) "Reg" else "Not Reg"}\n")
-            append("BT Diagnostics:\n")
-            append("- BT Adapter: ${if (bluetoothAdapter != null) "OK" else "NULL"}\n")
-            append("- BT Enabled: ${isBluetoothEnabled.value}\n")
-            append("- BT Receiver: ${if (bluetoothScanReceiver != null) "Reg" else "Not Reg"}\n")
-            append("System:\n- API Level: ${Build.VERSION.SDK_INT} (${Build.VERSION.RELEASE})\nPermissions (P2P):\n")
-            getWifiDirectPermissions().forEach { append("  - $it: ${ActivityCompat.checkSelfPermission(context,it) == PackageManager.PERMISSION_GRANTED}\n") }
-            append("Permissions (BT):\n")
-            getBluetoothPermissions().forEach { append("  - $it: ${ActivityCompat.checkSelfPermission(context,it) == PackageManager.PERMISSION_GRANTED}\n") }
-        }
-        Log.i("DevicesViewModel", diagnosticInfo.toString())
-
-        var statusMessage = "Diagnostic check done. See logs."
-        if (!isWifiEnabled) statusMessage = "Error: Wi-Fi is OFF."
-        else if (!systemLocationEnabled) statusMessage = "Error: System Location is OFF. Scans may fail."
-        permissionRequestStatus.value = statusMessage
-        return diagnosticInfo.toString()
-    }
-
-
-    private fun setupCommunicationStreams(socket: Any, technology: CommunicationTechnology) {
+    private suspend fun setupCommunicationStreams(socket: Any, technology: CommunicationTechnology) {
         Log.d("DevicesViewModel", "Setting up communication streams for ${technology.name} socket.")
         try {
             when (technology) {
@@ -782,12 +446,22 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             }
             objectOutputStream?.flush()
             Log.i("DevicesViewModel", "Communication streams established for ${technology.name}.")
-            permissionRequestStatus.value = "Streams open. Ready to sync."
+            
+            // Update UI on Main thread
+            withContext(Dispatchers.Main) {
+                permissionRequestStatus.value = "Streams open. Ready to sync."
+            }
+            
             startListeningForMessages()
 
         } catch (e: IOException) {
             Log.e("DevicesViewModel", "Error setting up communication streams for ${technology.name}: ", e)
-            permissionRequestStatus.value = "Error: Stream setup failed."
+            
+            // Update UI on Main thread
+            withContext(Dispatchers.Main) {
+                permissionRequestStatus.value = "Error: Stream setup failed."
+            }
+            
             if (technology == CommunicationTechnology.BLUETOOTH) {
                 disconnectBluetooth()
             } else {
@@ -826,16 +500,18 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
             Log.i("DevicesViewModel", "Stopped listening for messages.")
-            if (connectedBluetoothSocket != null || p2pIsConnected()) {
+            if (bluetoothConnectionManager.connectedSocket.value != null || p2pIsConnected()) {
                 launch(Dispatchers.Main) {
-                    if (_bluetoothConnectionStatus.value.startsWith("Connected")) _bluetoothConnectionStatus.value = "Disconnected (stream ended)"
+                    if (bluetoothConnectionStatus.value.startsWith("Connected")) {
+                        // Connection status will be updated by the connection manager
+                    }
                 }
             }
         }
     }
 
     private fun p2pIsConnected(): Boolean {
-        return _p2pConnectionStatus.value.startsWith("Connected") || _p2pConnectionStatus.value.startsWith("P2P Client Connected")
+        return wifiDirectManager.connectedSocket.value != null
     }
 
 
@@ -988,12 +664,11 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     persistHistory()
                 }
                 MessageType.DISCONNECT -> {
-                    _p2pConnectionStatus.value = "Disconnected (by peer)"
                     permissionRequestStatus.value = "Peer disconnected."
                     // Close the P2P connection if still open
                     viewModelScope.launch(Dispatchers.IO) {
                         closeCommunicationStreams()
-                        closeP2pSockets()
+                        disconnectP2p()
                         withContext(Dispatchers.Main) {
                             _isRefreshing.value = false
                         }
@@ -1002,216 +677,13 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             }
         }
     }
-    @SuppressLint("MissingPermission")
-    private fun handleAcceptedBluetoothConnection(socket: BluetoothSocket) {
-        val remoteDeviceName = try {socket.remoteDevice.name} catch(e:SecurityException){null} ?: socket.remoteDevice.address
-        Log.i("DevicesViewModel", "Handling accepted BT connection from $remoteDeviceName")
+    // P2P connection handling is now managed by WifiDirectManager
+    // The connected socket is automatically handled via the StateFlow collection in init{}
+    // Bluetooth connection handling is now managed by BluetoothConnectionManager
+    // The connected socket is automatically handled via the StateFlow collection in init{}
 
-        if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
-            Log.d("DevicesViewModel", "Switching from P2P to BT. Closing P2P connection.")
-            disconnectP2p()
-        }
-        connectedBluetoothSocket = socket
-        setupCommunicationStreams(socket, CommunicationTechnology.BLUETOOTH)
-        _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Connected", details = "Bluetooth connection accepted.", peerDeviceName = remoteDeviceName))
-        persistHistory()
-
-        viewModelScope.launch(Dispatchers.Main) {
-            _bluetoothConnectionStatus.value = "Accepted connection from $remoteDeviceName"
-            permissionRequestStatus.value = "BT Peer connected: $remoteDeviceName"
-        }
-    }
-
-    fun handleP2pConnectionInfo(info: WifiP2pInfo) {
-        viewModelScope.launch {
-            if (info.groupFormed) {
-                val peerDeviceName = if (info.isGroupOwner) "P2P Group Client" else info.groupOwnerAddress?.hostAddress ?: "P2P Group Owner"
-                if (info.isGroupOwner) {
-                    Log.i("DevicesViewModel", "P2P Group Owner. Starting P2P Server.")
-                    withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Group Owner: Starting Server..." }
-                    startP2pServer()
-                    _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Connected (Owner)", details = "P2P Group formed, acting as owner.", peerDeviceName = "Group Client (TBD)"))
-                    persistHistory()
-                } else {
-                    Log.i("DevicesViewModel", "P2P Client. Connecting to Group Owner: ${info.groupOwnerAddress?.hostAddress}")
-                    if (info.groupOwnerAddress?.hostAddress != null) {
-                        withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Client: Connecting to Owner..." }
-                        connectToP2pOwner(info.groupOwnerAddress.hostAddress)
-                        _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Connected (Client)", details = "P2P Group formed, acting as client.", peerDeviceName = info.groupOwnerAddress.hostAddress))
-                        persistHistory()
-                    } else {
-                        Log.e("DevicesViewModel", "P2P Client: Group owner address is null!")
-                        withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Error: Owner address null" }
-                        _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P Connection failed: Group owner address null."))
-                        persistHistory()
-                        disconnectP2p()
-                    }
-                }
-            } else {
-                Log.i("DevicesViewModel", "P2P Group not formed or connection lost.")
-                withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Disconnected (Group not formed)" }
-                // Add history if a sync was active
-                if (_isRefreshing.value) {
-                    _syncHistory.add(0, SyncHistoryEntry(folderName = "Active Sync", status = "Error", details = "P2P Group not formed or connection lost during active sync."))
-                }
-                disconnectP2p()
-            }
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    fun startP2pServer() {
-        if (p2pServerJob?.isActive == true) {
-            Log.d("DevicesViewModel", "P2P server job already active."); return
-        }
-        if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH && connectedBluetoothSocket != null) {
-            Log.d("DevicesViewModel", "Switching from BT to P2P Server. Closing BT connection.")
-            disconnectBluetooth()
-        }
-
-        p2pServerJob = viewModelScope.launch(Dispatchers.IO) {
-            Log.i("DevicesViewModel", "Starting P2P server...")
-            try {
-                closeP2pSockets()
-                p2pServerSocket = ServerSocket(AppConstants.P2P_PORT)
-                Log.i("DevicesViewModel", "P2P ServerSocket listening on port ${AppConstants.P2P_PORT}")
-                withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Listening as P2P Group Owner..." }
-
-                while (isActive) {
-                    try {
-                        Log.d("DevicesViewModel", "P2P server calling p2pServerSocket.accept()...")
-                        val client = p2pServerSocket?.accept()
-                        if (client != null) {
-                            closeP2pClientSocket()
-                            p2pClientSocket = client
-                            val remoteAddress = client.remoteSocketAddress.toString()
-                            Log.i("DevicesViewModel", "P2P connection accepted from: $remoteAddress")
-                            withContext(Dispatchers.Main) {
-                                _p2pConnectionStatus.value = "P2P Client Connected: $remoteAddress"
-                                permissionRequestStatus.value = "P2P Client Connected: $remoteAddress"
-                            }
-                            // History entry for accepted P2P connection already handled in handleP2pConnectionInfo (group owner part)
-                            setupCommunicationStreams(p2pClientSocket!!, CommunicationTechnology.P2P)
-                        } else {
-                            if (!isActive) break
-                            Log.w("DevicesViewModel", "P2P server accept() returned null without exception.")
-                        }
-                    } catch (e: IOException) {
-                        if (isActive) { Log.e("DevicesViewModel", "P2P server socket accept() failed or closed: ${e.message}", e) }
-                        else { Log.d("DevicesViewModel", "P2P server socket accept() interrupted by cancellation.") }
-                        break
-                    }
-                }
-            } catch (e: IOException) {
-                Log.e("DevicesViewModel", "P2P server ServerSocket() failed: ${e.message}", e)
-                withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Server Error: ${e.message}" }
-                 _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P Server failed to start: ${e.message}"))
-                persistHistory()
-            } catch (se: SecurityException) {
-                Log.e("DevicesViewModel", "SecEx starting P2P server: ${se.message}", se)
-                withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Server Permission Error" }
-                 _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P Server permission error: ${se.message}"))
-                persistHistory()
-            } finally {
-                Log.d("DevicesViewModel", "P2P server thread ending.")
-                closeP2pServerSocket()
-                if (!isActive && _p2pConnectionStatus.value.startsWith("Listening")) {
-                    withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Server Stopped" }
-                }
-            }
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    fun connectToP2pOwner(ownerAddress: String?) {
-        if (ownerAddress == null) {
-            Log.e("DevicesViewModel", "Cannot connect to P2P owner: address is null.")
-            _p2pConnectionStatus.value = "Error: Owner address null"
-             _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "Cannot connect to P2P owner: address is null."))
-            persistHistory()
-            return
-        }
-        if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH && connectedBluetoothSocket != null) {
-            Log.d("DevicesViewModel", "Switching from BT to P2P Client. Closing BT connection.")
-            disconnectBluetooth()
-        }
-
-        viewModelScope.launch(Dispatchers.IO) {
-            Log.i("DevicesViewModel", "Connecting to P2P Group Owner at $ownerAddress:${AppConstants.P2P_PORT}")
-            withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "Connecting to P2P Group Owner..." }
-            try {
-                closeP2pSockets()
-                p2pClientSocket = Socket(ownerAddress, AppConstants.P2P_PORT)
-                Log.i("DevicesViewModel", "Successfully connected to P2P Group Owner: ${p2pClientSocket?.remoteSocketAddress}")
-                withContext(Dispatchers.Main) {
-                    _p2pConnectionStatus.value = "Connected to P2P Group Owner"
-                    permissionRequestStatus.value = "P2P Connected to Owner"
-                }
-                // History entry for successful P2P client connection handled in handleP2pConnectionInfo
-                setupCommunicationStreams(p2pClientSocket!!, CommunicationTechnology.P2P)
-            } catch (e: IOException) {
-                Log.e("DevicesViewModel", "P2P client connection failed: ${e.message}", e)
-                withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Connection Failed: ${e.localizedMessage}" }
-                _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P client connection failed: ${e.message}", peerDeviceName = ownerAddress))
-                persistHistory()
-                closeP2pClientSocket()
-            } catch (se: SecurityException) {
-                Log.e("DevicesViewModel", "SecurityException during P2P client connection: ${se.message}", se)
-                withContext(Dispatchers.Main) { _p2pConnectionStatus.value = "P2P Connection Permission Error" }
-                 _syncHistory.add(0, SyncHistoryEntry(folderName = "N/A", status = "Error", details = "P2P client connection permission error: ${se.message}", peerDeviceName = ownerAddress))
-                persistHistory()
-                closeP2pClientSocket()
-            }
-        }
-    }
-
-    private fun closeP2pClientSocket() {
-        try { p2pClientSocket?.close() }
-        catch (e: IOException) { Log.w("DevicesViewModel", "Error closing p2pClientSocket: ${e.message}") }
-        finally { p2pClientSocket = null }
-    }
-
-    private fun closeP2pServerSocket() {
-        try { p2pServerSocket?.close() }
-        catch (e: IOException) { Log.w("DevicesViewModel", "Error closing p2pServerSocket: ${e.message}") }
-        finally { p2pServerSocket = null }
-    }
-
-    private fun closeP2pSockets() {
-        closeP2pClientSocket()
-        closeP2pServerSocket()
-    }
-
-    fun disconnectP2p() {
-        viewModelScope.launch(Dispatchers.IO) {
-            Log.i("DevicesViewModel", "Disconnecting P2P...")
-            // Send DISCONNECT message to peer before closing
-            try {
-                sendMessage(SyncMessage(MessageType.DISCONNECT))
-            } catch (e: Exception) {
-                Log.w("DevicesViewModel", "Failed to send DISCONNECT message: ${e.message}")
-            }
-            if (_isRefreshing.value && (p2pClientSocket != null || p2pServerSocket != null) ) { // If a sync was active
-                _syncHistory.add(0, SyncHistoryEntry(folderName = "Active Sync", status = "Error", details = "P2P Disconnected during active sync."))
-                persistHistory()
-            }
-            p2pServerJob?.cancel()
-            p2pServerJob = null
-
-            if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
-                closeCommunicationStreams()
-            }
-            closeP2pSockets()
-
-            withContext(Dispatchers.Main) {
-                _p2pConnectionStatus.value = "Disconnected"
-                if (permissionRequestStatus.value.startsWith("P2P")) {
-                    permissionRequestStatus.value = "P2P Disconnected."
-                }
-            }
-            Log.i("DevicesViewModel", "P2P disconnected.")
-        }
-    }
+    // P2P disconnection is delegated to WifiDirectManager
+    fun disconnectP2p() = wifiDirectManager.disconnect()
 
     // --- SAF Integrated File Handling ---
     private fun getLocalFileMetadata(folderUri: Uri): List<FileMetadata> {
@@ -1630,42 +1102,14 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    @RequiresPermission(Manifest.permission.ACCESS_FINE_LOCATION)
-    fun forceRequestPeers() {
-        Log.i("DevicesViewModel", "forceRequestPeers() called.")
-        if (wifiP2pManager == null || p2pChannel == null) {
-            Log.e("DevicesViewModel", "forceRequestPeers - P2PManager or Channel is null.")
-            permissionRequestStatus.value = "P2P System not ready for peer request."
-            _isRefreshing.value = false
-            return
-        }
-        // Define or reuse your PeerListListener here
-        val peerListListener = WifiP2pManager.PeerListListener { peers ->
-            Log.i("DevicesViewModel", "forceRequestPeers - PeerListListener.onPeersAvailable. System peer list size: [${peers?.deviceList?.size ?: "null"}")
-            onP2pPeersAvailable(peers?.deviceList ?: emptyList())
-        }
-        try {
-            wifiP2pManager?.requestPeers(p2pChannel, peerListListener)
-        } catch (e: SecurityException) {
-            Log.e("DevicesViewModel", "SecurityException during forceRequestPeers: ${e.message}", e)
-            permissionRequestStatus.value = "Permission error requesting peers."
-        }
-    }
-
-    
     override fun onCleared() {
         super.onCleared()
         Log.d("DevicesViewModel", "onCleared called.")
-        unregisterP2pReceiver()
+        wifiDirectManager.cleanup()
         stopBluetoothDiscovery()
         disconnectBluetooth()
         stopBluetoothServer()
         closeCommunicationStreams()
-        if (p2pChannel != null && wifiP2pManager != null) {
-            try { wifiP2pManager?.stopPeerDiscovery(p2pChannel, null) }
-            catch (e: SecurityException) { Log.w("DevicesViewModel", "SecEx onCleared/stopP2pDisc: ${e.message}")}
-            catch (e: Exception) { Log.w("DevicesViewModel", "Ex onCleared/stopP2pDisc: ${e.message}")}
-        }
         Log.d("DevicesViewModel", "onCleared finished.")
     }
 
@@ -1677,38 +1121,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             handleIncomingMessage(msg)
         }
     }
-
-    /**
-     * Fully resets all P2P state, peer/device lists, and statuses, as if the app just started.
-     * Use this for a true 'fresh start' after disconnect.
-     */
-    fun fullResetP2pConnection() {
-        Log.i("DevicesViewModel", "fullResetP2pConnection CALLED - Full P2P state reset")
-        // Try to remove the group at the system level
-        try {
-            if (wifiP2pManager != null && p2pChannel != null) {
-                wifiP2pManager?.removeGroup(p2pChannel, object : WifiP2pManager.ActionListener {
-                    override fun onSuccess() {
-                        Log.i("DevicesViewModel", "removeGroup succeeded in fullResetP2pConnection")
-                    }
-                    override fun onFailure(reason: Int) {
-                        Log.w("DevicesViewModel", "removeGroup failed in fullResetP2pConnection: reason $reason")
-                    }
-                })
-            }
-        } catch (e: Exception) {
-            Log.e("DevicesViewModel", "Exception in removeGroup during fullResetP2pConnection: ${e.message}", e)
-        }
-        resetWifiDirectSystem()
-        // Clear all peer/device lists and statuses
-        wifiDirectPeersInternal.clear()
-        bluetoothDevicesInternal.clear()
-        displayableDeviceList.clear()
-        _p2pConnectionStatus.value = "Disconnected"
-        _isRefreshing.value = false
-        permissionRequestStatus.value = "Idle. Tap a scan button."
-    }
-
     // --- Reference to ManageFoldersViewModel for folder registration ---
     private var manageFoldersViewModel: ManageFoldersViewModel? = null
     fun setManageFoldersViewModel(vm: ManageFoldersViewModel) { manageFoldersViewModel = vm }

@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -51,7 +52,7 @@ fun DevicesScreen(
     // Declare permissionStatus by viewModel.permissionRequestStatus before it's used in remember for locationServicesOn
     val permissionStatus by remember { viewModel.permissionRequestStatus }
     val isRefreshing by viewModel.isRefreshing.collectAsState()
-    val isBluetoothActuallyEnabled by viewModel.isBluetoothEnabled
+    val isBluetoothActuallyEnabled by viewModel.isBluetoothEnabled.collectAsState()
     val lifecycleOwner = LocalLifecycleOwner.current
     val coroutineScope = rememberCoroutineScope()
 
@@ -70,7 +71,6 @@ fun DevicesScreen(
             Log.d("DevicesScreen", "All Wi-Fi Direct permissions GRANTED by launcher.")
             viewModel.permissionRequestStatus.value = "Wi-Fi Direct permissions granted. Scanning..."
             try {
-                viewModel.registerP2pReceiver()
                 viewModel.startP2pDiscovery()
             } catch (e: SecurityException) {
                 Log.e("DevicesScreen", "SecurityException (Wi-Fi Direct launch): ${e.message}", e)
@@ -109,10 +109,9 @@ fun DevicesScreen(
                 Lifecycle.Event.ON_RESUME -> {
                     Log.d("DevicesScreen", "ON_RESUME triggered.")
                     if (getWifiDirectPermissions().all { context.hasPermission(it) }) {
-                        try { viewModel.registerP2pReceiver() } catch (e: SecurityException) { Log.e("DevicesScreen", "SecEx P2P Reg: ${e.message}", e) }
+                        Log.d("DevicesScreen", "ON_RESUME: Wi-Fi Direct permissions OK.")
                     } else { Log.w("DevicesScreen", "ON_RESUME: Wi-Fi Direct permissions MISSING.") }
 
-                    viewModel.updateBluetoothState()
                     if (viewModel.isBluetoothEnabled.value) {
                         // Check Bluetooth permissions before starting server
                         val btPerms = getBluetoothPermissions()
@@ -128,7 +127,6 @@ fun DevicesScreen(
                 }
                 Lifecycle.Event.ON_PAUSE -> {
                     Log.d("DevicesScreen", "ON_PAUSE triggered.")
-                    viewModel.unregisterP2pReceiver()
                     viewModel.stopBluetoothDiscovery()
                 }
                 else -> {}
@@ -171,8 +169,14 @@ fun DevicesScreen(
             Spacer(modifier = Modifier.height(8.dp))
         }
         val btConnectionStatus by viewModel.bluetoothConnectionStatus.collectAsState()
+        val p2pConnectionStatus by viewModel.p2pConnectionStatus.collectAsState()
         Text(
             text = "BT Status: $btConnectionStatus",
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Text(
+            text = "P2P Status: $p2pConnectionStatus",
             style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.fillMaxWidth()
         )
@@ -189,7 +193,6 @@ fun DevicesScreen(
                     val perms = getWifiDirectPermissions()
                     if (perms.all { context.hasPermission(it) }) {
                         try {
-                            viewModel.registerP2pReceiver()
                             viewModel.startP2pDiscovery()
                         } catch (e: SecurityException) { Log.e("DevicesScreen", "SecEx P2P Scan: ${e.message}", e) }
                     } else {
@@ -276,8 +279,7 @@ fun DevicesScreen(
                         try {
                             when (device.technology) {
                                 DeviceTechnology.WIFI_DIRECT -> {
-                                    val p2pDevice = device.originalDeviceObject as? WifiP2pDevice
-                                    p2pDevice?.let { coroutineScope.launch { viewModel.connectToP2pDevice(it) } }
+                                    coroutineScope.launch { viewModel.connectToP2pDevice(device) }
                                 }
                                 DeviceTechnology.BLUETOOTH_CLASSIC -> {
                                     val btDevice = device.originalDeviceObject as? BluetoothDevice

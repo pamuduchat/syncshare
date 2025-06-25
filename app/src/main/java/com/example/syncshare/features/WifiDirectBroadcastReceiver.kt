@@ -13,13 +13,13 @@ import android.net.wifi.p2p.WifiP2pInfo
 import android.os.Build
 import android.util.Log
 import androidx.core.app.ActivityCompat
-import com.example.syncshare.viewmodels.DevicesViewModel
+import com.example.syncshare.management.WifiDirectManager
 import com.example.syncshare.utils.getDeviceP2pStatusString
 
 class WifiDirectBroadcastReceiver(
     private val manager: WifiP2pManager?,
     private val channel: WifiP2pManager.Channel?,
-    private val viewModel: DevicesViewModel
+    private val wifiDirectManager: WifiDirectManager
 ) : BroadcastReceiver() {
 
     @SuppressLint("MissingPermission") // Permissions are expected to be checked by the caller initiating discovery/connection
@@ -50,17 +50,17 @@ class WifiDirectBroadcastReceiver(
                         override fun onPeersAvailable(peerList: WifiP2pDeviceList?) {
                             Log.i("WifiDirectReceiver", "PeerListListener.onPeersAvailable | System peer list size: ${peerList?.deviceList?.size ?: "null"}")
                             if (peerList != null) {
-                                // Corrected call to the renamed method in ViewModel
-                                viewModel.onP2pPeersAvailable(peerList.deviceList ?: emptyList())
+                                // Corrected call to the renamed method in WifiDirectManager
+                                wifiDirectManager.onP2pPeersAvailable(peerList.deviceList ?: emptyList())
                             } else {
                                 Log.w("WifiDirectReceiver", "PeerListListener.onPeersAvailable received NULL peerList object.")
-                                viewModel.onP2pPeersAvailable(emptyList())
+                                wifiDirectManager.onP2pPeersAvailable(emptyList())
                             }
                         }
                     })
                 } else {
                     Log.e("WifiDirectReceiver", "ACCESS_FINE_LOCATION permission NOT granted when WIFI_P2P_PEERS_CHANGED_ACTION received. Cannot request peers.")
-                    viewModel.onP2pPeersAvailable(emptyList()) // Inform ViewModel no peers can be fetched
+                    wifiDirectManager.onP2pPeersAvailable(emptyList()) // Inform WifiDirectManager no peers can be fetched
                 }
             }
             WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
@@ -70,7 +70,7 @@ class WifiDirectBroadcastReceiver(
                     manager?.requestConnectionInfo(channel, object : WifiP2pManager.ConnectionInfoListener {
                         override fun onConnectionInfoAvailable(info: WifiP2pInfo) {
                             Log.i("WifiDirectReceiver", "Connection info available. Group formed: ${info.groupFormed}, Is GO: ${info.isGroupOwner}")
-                            viewModel.handleP2pConnectionInfo(info)
+                            wifiDirectManager.handleConnectionInfo(info)
                         }
                     })
                 } else {
