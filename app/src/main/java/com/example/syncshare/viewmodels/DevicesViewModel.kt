@@ -108,29 +108,158 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         // Remove the conflict from the list
         val updated = _fileConflicts.value.toMutableList().apply { remove(conflict) }
         _fileConflicts.value = updated
-        when (option) {
-            ConflictResolutionOption.KEEP_LOCAL -> {
-                // Do nothing, keep local file
-            }
-            ConflictResolutionOption.USE_REMOTE -> {
-                // Request the remote file
-                sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = conflict.folderName, requestedFilePaths = listOf(conflict.relativePath)))
-            }
-            ConflictResolutionOption.KEEP_BOTH -> {
-                // Request remote file, but with a new name (e.g., append _remote or timestamp)
-                val newPath = conflict.relativePath + "_remote_${System.currentTimeMillis()}"
-                // The receiver will need to handle this rename on receipt
-                sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = conflict.folderName, requestedFilePaths = listOf(conflict.relativePath)))
-            }
-            ConflictResolutionOption.SKIP -> {
-                // Do nothing
-            }
-        }
-        // If all conflicts resolved, resume sync if needed
+        
+        // Store the resolution for processing
+        val currentResolutions = conflictResolutions.toMutableMap()
+        currentResolutions[conflict.relativePath] = option
+        conflictResolutions = currentResolutions
+        
+        Log.d("DevicesViewModel", "Conflict resolved for ${conflict.relativePath}: $option")
+        
+        // If all conflicts resolved, process the resolutions
         if (_fileConflicts.value.isEmpty()) {
-            _isRefreshing.value = false
-            permissionRequestStatus.value = "All conflicts resolved. Sync can continue."
+            processConflictResolutions(conflict.folderName)
         }
+    }
+    
+    // Store conflict resolutions temporarily
+    private var conflictResolutions = mapOf<String, ConflictResolutionOption>()
+    
+    // Store pending sync state for resuming after conflict resolution
+    private data class PendingSyncState(
+        val folderName: String,
+        val localFolderUri: Uri,
+        val filesToRequest: List<String>,
+        val filesToSend: List<String>
+    )
+    private var pendingSyncState: PendingSyncState? = null
+    
+    // Store sync session state for tracking file send completion
+    private data class SyncSession(
+        val folderName: String,
+        val totalFilesToSend: Int,
+        val filesSentSuccessfully: Int = 0
+    )
+    private var currentSyncSession: SyncSession? = null
+    
+    private fun processConflictResolutions(folderName: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val filesToRequest = mutableListOf<String>()
+            val localFolderUri = _activeSyncDestinationUris.value[folderName]
+            
+            if (localFolderUri == null) {
+                Log.e("DevicesViewModel", "Cannot process conflicts: No URI for folder $folderName")
+                return@launch
+            }
+            
+            // Process each resolution
+            for ((relativePath, resolution) in conflictResolutions) {
+                when (resolution) {
+                    ConflictResolutionOption.KEEP_LOCAL -> {
+                        // Do nothing, keep local file as is
+                        Log.d("DevicesViewModel", "Keeping local version of $relativePath")
+                    }
+                    ConflictResolutionOption.USE_REMOTE -> {
+                        // Request the remote file to overwrite local
+                        filesToRequest.add(relativePath)
+                        Log.d("DevicesViewModel", "Will request remote version of $relativePath")
+                    }
+                    ConflictResolutionOption.KEEP_BOTH -> {
+                        // For KEEP_BOTH, we request the file normally but mark it for renaming
+                        filesToRequest.add(relativePath)
+                        
+                        // Generate the rename target
+                        val extension = relativePath.substringAfterLast('.', "")
+                        val nameWithoutExtension = relativePath.substringBeforeLast('.', relativePath)
+                        val newName = if (extension.isNotEmpty()) {
+                            "${nameWithoutExtension}_remote.$extension"
+                        } else {
+                            "${relativePath}_remote"
+                        }
+                        
+                        // Store the rename mapping for later use
+                        fileRenameMap[relativePath] = newName
+                        Log.d("DevicesViewModel", "Will request remote version of $relativePath and save as $newName")
+                    }
+                    ConflictResolutionOption.SKIP -> {
+                        // Do nothing with this file
+                        Log.d("DevicesViewModel", "Skipping $relativePath")
+                    }
+                }
+            }
+            
+            // Get the pending sync state (files that need to be sent/received)
+            val syncState = pendingSyncState
+            if (syncState != null) {
+                // Add the original non-conflicting files to the request list
+                filesToRequest.addAll(syncState.filesToRequest)
+                
+                Log.d("DevicesViewModel", "Resuming two-way sync after conflict resolution:")
+                Log.d("DevicesViewModel", "- Requesting ${filesToRequest.size} files (${conflictResolutions.size} from conflicts + ${syncState.filesToRequest.size} non-conflicting)")
+                Log.d("DevicesViewModel", "- Sending ${syncState.filesToSend.size} files")
+                
+                // Request all files we need (conflict resolutions + non-conflicting)
+                if (filesToRequest.isNotEmpty()) {
+                    sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = folderName, requestedFilePaths = filesToRequest))
+                }
+                
+                // Send files that remote needs from us
+                if (syncState.filesToSend.isNotEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        permissionRequestStatus.value = "Sending ${syncState.filesToSend.size} files to peer..."
+                    }
+                    
+                    // Send each file
+                    syncState.filesToSend.forEach { relativePath ->
+                        if (currentCoroutineContext().isActive) {
+                            sendFile(syncState.localFolderUri, relativePath, folderName)
+                        }
+                    }
+                }
+                
+                // If neither device needs files after conflict resolution, sync is complete
+                if (filesToRequest.isEmpty() && syncState.filesToSend.isEmpty()) {
+                    Log.d("DevicesViewModel", "No files to sync after conflict resolution - folders are synchronized")
+                    sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = folderName))
+                    withContext(Dispatchers.Main) {
+                        _isRefreshing.value = false
+                        permissionRequestStatus.value = "Sync complete - conflicts resolved, folders synchronized."
+                    }
+                }
+            } else {
+                Log.e("DevicesViewModel", "No pending sync state found after conflict resolution")
+                // Fallback: just request the conflict resolution files
+                if (filesToRequest.isNotEmpty()) {
+                    Log.d("DevicesViewModel", "Requesting ${filesToRequest.size} files after conflict resolution")
+                    sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = folderName, requestedFilePaths = filesToRequest))
+                } else {
+                    // No files to request, sync is complete
+                    withContext(Dispatchers.Main) {
+                        _isRefreshing.value = false
+                        permissionRequestStatus.value = "Conflict resolution complete. No files to sync."
+                    }
+                }
+            }
+            
+            // Clear the resolutions and pending state
+            conflictResolutions = emptyMap()
+            pendingSyncState = null
+        }
+    }
+    
+    // Map to track file renames for KEEP_BOTH option
+    private var fileRenameMap = mutableMapOf<String, String>()
+    
+    // Clear all conflicts (for testing or if user wants to cancel conflict resolution)
+    fun clearAllConflicts() {
+        _fileConflicts.value = emptyList()
+        conflictResolutions = emptyMap()
+        fileRenameMap.clear()
+        pendingSyncState = null
+        currentSyncSession = null
+        pendingFileSends.clear()
+        _isRefreshing.value = false
+        permissionRequestStatus.value = "Conflicts cleared. Ready to sync."
     }
 
     private val prefs: SharedPreferences = application.getSharedPreferences("syncshare_prefs", Context.MODE_PRIVATE)
@@ -555,12 +684,28 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                                 // File exists on remote but not local, request it
                                 filesToRequest.add(remotePath)
                             } else {
-                                // File exists on both, compare to detect conflicts
-                                if (remoteMeta.size != localMeta.size || remoteMeta.hash != localMeta.hash) {
-                                    // Conflict detected: both exist, but content differs
+                                // File exists on both, check if they're actually different (content-wise)
+                                val sizesDifferent = remoteMeta.size != localMeta.size
+                                val hashesDifferent = remoteMeta.hash != null && localMeta.hash != null && remoteMeta.hash != localMeta.hash
+                                val modifiedTimesDifferent = remoteMeta.lastModified != localMeta.lastModified
+                                
+                                // A conflict occurs only if the content is actually different
+                                // (different sizes OR different hashes when both are available)
+                                val hasContentDifference = sizesDifferent || hashesDifferent
+                                
+                                if (hasContentDifference) {
+                                    // Files have different content - this is a true conflict
+                                    Log.d("DevicesViewModel", "Content conflict detected for $remotePath: size(${localMeta.size} vs ${remoteMeta.size}), hash(${localMeta.hash} vs ${remoteMeta.hash}), modified(${localMeta.lastModified} vs ${remoteMeta.lastModified})")
                                     conflicts.add(FileConflict(folderName ?: "", remotePath, localMeta, remoteMeta))
+                                } else {
+                                    // Files have same content (same size and hash if available)
+                                    // Even if modified times differ, this is not a conflict
+                                    if (modifiedTimesDifferent) {
+                                        Log.d("DevicesViewModel", "File $remotePath has same content but different modified time (${localMeta.lastModified} vs ${remoteMeta.lastModified}), no sync needed")
+                                    } else {
+                                        Log.d("DevicesViewModel", "File $remotePath is identical on both devices, skipping")
+                                    }
                                 }
-                                // If sizes and hashes are the same, treat as identical, skip
                             }
                         }
                         
@@ -575,6 +720,17 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         // --- Pause sync and show conflicts if any ---
                         if (conflicts.isNotEmpty()) {
                             _fileConflicts.value = conflicts
+                            
+                            // Store the pending sync state for resuming after conflict resolution
+                            pendingSyncState = PendingSyncState(
+                                folderName = folderName ?: "",
+                                localFolderUri = localFolderUri,
+                                filesToRequest = filesToRequest,
+                                filesToSend = filesToSend
+                            )
+                            
+                            Log.d("DevicesViewModel", "Conflicts detected. Stored pending sync state: ${filesToRequest.size} files to request, ${filesToSend.size} files to send")
+                            
                             withContext(Dispatchers.Main) {
                                 _isRefreshing.value = false
                                 permissionRequestStatus.value = "File conflicts detected. Please resolve." 
@@ -633,18 +789,22 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     }
 
                     permissionRequestStatus.value = "Peer requested ${requestedPaths?.size ?: 0} files from '${baseFolderName}'."
-                    requestedPaths?.forEach { relativePath ->
-                        launch(Dispatchers.IO) {
-                            sendFile(senderBaseUri, relativePath, baseFolderName ?: "")
-                        }
-                    }
+                    
                     if (requestedPaths.isNullOrEmpty()){
+                        // No files to send, sync is complete
                         sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = message.folderName))
-                        // --- Fix: Re-enable sync button if no files to send ---
                         _isRefreshing.value = false
                         permissionRequestStatus.value = "Sync complete (no files to send)."
                     } else {
-                        Log.d("DevicesViewModel", "TODO: Need to track completion of ${requestedPaths.size} file sends before sending SYNC_COMPLETE.")
+                        // Store the expected completion for this sync session
+                        currentSyncSession = SyncSession(baseFolderName ?: "", requestedPaths.size)
+                        Log.d("DevicesViewModel", "Starting to send ${requestedPaths.size} files for sync session")
+                        
+                        requestedPaths.forEach { relativePath ->
+                            launch(Dispatchers.IO) {
+                                sendFile(senderBaseUri, relativePath, baseFolderName ?: "")
+                            }
+                        }
                     }
                 }
                 MessageType.FILE_TRANSFER_START -> {
@@ -673,36 +833,91 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         return@launch
                     }
 
-                    Log.i("DevicesViewModel", "Receiving file: ${info.relativePath}, Size: ${info.fileSize} into folder '$folderName' (URI: $destinationUri)")
-                    permissionRequestStatus.value = "Receiving: ${info.relativePath} for $folderName"
+                    // Check if this file should be renamed (KEEP_BOTH option)
+                    val finalPath = fileRenameMap[info.relativePath] ?: info.relativePath
+                    val isRenamed = finalPath != info.relativePath
+                    
+                    if (isRenamed) {
+                        Log.i("DevicesViewModel", "File ${info.relativePath} will be saved as $finalPath (KEEP_BOTH conflict resolution)")
+                    }
+
+                    Log.i("DevicesViewModel", "Receiving file: ${info.relativePath} -> $finalPath, Size: ${info.fileSize} into folder '$folderName'")
+                    permissionRequestStatus.value = if (isRenamed) {
+                        "Receiving: ${info.relativePath} as $finalPath for $folderName"
+                    } else {
+                        "Receiving: $finalPath for $folderName"
+                    }
+                    
                     currentReceivingFile = FileTransferState(
                         folderName = folderName,
-                        relativePath = info.relativePath,
+                        relativePath = finalPath, // Use the final path (renamed if needed)
                         totalSize = info.fileSize,
-                        destinationBaseUri = destinationUri
+                        destinationBaseUri = destinationUri,
+                        originalPath = info.relativePath // Store original for tracking
                     )
-                    _syncHistory.add(0, SyncHistoryEntry(folderName = folderName, status = "File Transfer", details = "Receiving file: ${info.relativePath} (${info.fileSize} bytes)"))
+                    
+                    val displayPath = if (isRenamed) "$finalPath (renamed from ${info.relativePath})" else finalPath
+                    _syncHistory.add(0, SyncHistoryEntry(folderName = folderName, status = "File Transfer", details = "Receiving file: $displayPath (${info.fileSize} bytes)"))
                     persistHistory()
                 }
                 MessageType.FILE_CHUNK -> { message.fileChunkData?.let { appendFileChunk(it) } }
                 MessageType.FILE_TRANSFER_END -> {
-                    val info = message.fileTransferInfo; Log.i("DevicesViewModel", "File transfer finished for: ${info?.relativePath}"); permissionRequestStatus.value = "Received: ${info?.relativePath}"; finalizeReceivedFile(); info?.let { sendMessage(SyncMessage(MessageType.FILE_RECEIVED_ACK, fileTransferInfo = FileTransferInfo(it.relativePath, 0L)))}; currentReceivingFile = null
+                    val info = message.fileTransferInfo
+                    Log.i("DevicesViewModel", "File transfer finished for: ${info?.relativePath}")
+                    
+                    val state = currentReceivingFile
+                    val displayPath = if (state != null && state.originalPath != state.relativePath) {
+                        "${state.relativePath} (renamed from ${state.originalPath})"
+                    } else {
+                        info?.relativePath ?: "unknown file"
+                    }
+                    
+                    permissionRequestStatus.value = "Received: $displayPath"
+                    finalizeReceivedFile()
+                    
+                    // Clean up rename map if this was a renamed file
+                    if (state != null && fileRenameMap.containsKey(state.originalPath)) {
+                        fileRenameMap.remove(state.originalPath)
+                        Log.d("DevicesViewModel", "Cleaned up rename mapping for ${state.originalPath}")
+                    }
+                    
+                    info?.let { 
+                        sendMessage(SyncMessage(MessageType.FILE_RECEIVED_ACK, fileTransferInfo = FileTransferInfo(it.relativePath, 0L)))
+                    }
+                    currentReceivingFile = null
                 }
                 MessageType.FILE_RECEIVED_ACK -> { Log.i("DevicesViewModel", "Peer ACKed file: ${message.fileTransferInfo?.relativePath}") }
                 MessageType.SYNC_COMPLETE -> {
-                    Log.i("DevicesViewModel", "SYNC_COMPLETE received for folder: ${message.folderName}"); permissionRequestStatus.value = "Sync complete for '${message.folderName}'."; _isRefreshing.value = false
+                    Log.i("DevicesViewModel", "SYNC_COMPLETE received for folder: ${message.folderName}")
                     _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "Unknown", status = "Completed", details = "Sync successfully completed for folder."))
                     persistHistory()
-                    // --- Reset syncMetadataSentForSession at the end of a sync ---
+                    
+                    // Clear sync state
+                    currentSyncSession = null
+                    pendingFileSends.clear()
                     syncMetadataSentForSession = false
+                    
+                    // Update UI
+                    _isRefreshing.value = false
+                    permissionRequestStatus.value = "Sync complete for '${message.folderName}'."
                 }
                 MessageType.ERROR_MESSAGE -> {
-                    Log.e("DevicesViewModel", "Received ERROR_MESSAGE: ${message.errorMessage}"); permissionRequestStatus.value = "Error from peer: ${message.errorMessage}"
+                    Log.e("DevicesViewModel", "Received ERROR_MESSAGE: ${message.errorMessage}")
                     _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "Associated with error", status = "Error", details = "Error during sync: ${message.errorMessage}"))
                     persistHistory()
+                    
+                    // Clear sync state on error
+                    currentSyncSession = null
+                    pendingFileSends.clear()
+                    _isRefreshing.value = false
+                    permissionRequestStatus.value = "Error from peer: ${message.errorMessage}"
                 }
                 MessageType.DISCONNECT -> {
+                    // Clear all sync state when peer disconnects
+                    currentSyncSession = null
+                    pendingFileSends.clear()
                     permissionRequestStatus.value = "Peer disconnected."
+                    
                     // Close the communication and disconnect
                     viewModelScope.launch(Dispatchers.IO) {
                         closeCommunicationStreams()
@@ -776,6 +991,11 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             persistHistory()
             return
         }
+        
+        // Clear any previous sync state
+        currentSyncSession = null
+        pendingFileSends.clear()
+        
         val context = getApplication<Application>().applicationContext
         val folderNameForSyncMessage = DocumentFile.fromTreeUri(context, folderUri)?.name ?: folderUri.toString()
 
@@ -919,12 +1139,36 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             persistHistory()
         }
 
-        // --- Remove from pending and re-enable sync button if done ---
+        // --- Remove from pending and track sync session completion ---
         pendingFileSends.remove(relativePath)
-        if (pendingFileSends.isEmpty()) {
+        
+        // Update sync session progress
+        currentSyncSession?.let { session ->
+            if (session.folderName == syncFolderName) {
+                val updatedSession = session.copy(filesSentSuccessfully = session.filesSentSuccessfully + 1)
+                currentSyncSession = updatedSession
+                
+                Log.d("DevicesViewModel", "Sync session progress: ${updatedSession.filesSentSuccessfully}/${updatedSession.totalFilesToSend} files sent for folder '${session.folderName}'")
+                
+                // Check if all files in this sync session have been sent
+                if (updatedSession.filesSentSuccessfully >= updatedSession.totalFilesToSend) {
+                    Log.d("DevicesViewModel", "All files sent for sync session '${session.folderName}'. Sending SYNC_COMPLETE.")
+                    sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = session.folderName))
+                    currentSyncSession = null // Clear the session
+                    
+                    withContext(Dispatchers.Main) {
+                        _isRefreshing.value = false
+                        permissionRequestStatus.value = "Sync complete for '${session.folderName}'."
+                    }
+                }
+            }
+        }
+        
+        // Fallback: if no sync session but all pending sends are done, complete anyway
+        if (currentSyncSession == null && pendingFileSends.isEmpty()) {
             withContext(Dispatchers.Main) {
                 _isRefreshing.value = false
-                permissionRequestStatus.value = "Sync complete for '$syncFolderName'."
+                permissionRequestStatus.value = "All file transfers complete."
             }
         }
     }
@@ -955,7 +1199,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         val relativePath: String,
         val totalSize: Long,
         var bytesReceived: Long = 0L,
-        val destinationBaseUri: Uri
+        val destinationBaseUri: Uri,
+        val originalPath: String = relativePath // Store original path for tracking
     )
 
     private fun appendFileChunk(chunk: ByteArray) {
@@ -1056,13 +1301,25 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         try {
             currentFileOutputStream?.flush()
             currentFileOutputStream?.close()
-            Log.i("DevicesViewModel", "File ${state.relativePath} finalized in ${state.destinationBaseUri}. Total bytes: ${state.bytesReceived}/${state.totalSize}")
-            if (state.bytesReceived != state.totalSize) {
-                Log.w("DevicesViewModel", "File size mismatch for ${state.relativePath}! Expected ${state.totalSize}, got ${state.bytesReceived}")
-                _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "File size mismatch for ${state.relativePath}. Expected ${state.totalSize}, got ${state.bytesReceived}."))
+            
+            val displayPath = if (state.originalPath != state.relativePath) {
+                "${state.relativePath} (renamed from ${state.originalPath})"
             } else {
-                 _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "File Received", details = "File ${state.relativePath} received successfully."))
-                
+                state.relativePath
+            }
+            
+            Log.i("DevicesViewModel", "File $displayPath finalized in ${state.destinationBaseUri}. Total bytes: ${state.bytesReceived}/${state.totalSize}")
+            
+            if (state.bytesReceived != state.totalSize) {
+                Log.w("DevicesViewModel", "File size mismatch for $displayPath! Expected ${state.totalSize}, got ${state.bytesReceived}")
+                _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "Error", details = "File size mismatch for $displayPath. Expected ${state.totalSize}, got ${state.bytesReceived}."))
+            } else {
+                val successDetails = if (state.originalPath != state.relativePath) {
+                    "File ${state.relativePath} received successfully (renamed from ${state.originalPath} due to conflict resolution)."
+                } else {
+                    "File ${state.relativePath} received successfully."
+                }
+                _syncHistory.add(0, SyncHistoryEntry(folderName = state.folderName, status = "File Received", details = successDetails))
             }
             persistHistory()
             // --- Log first 16 bytes of the written file ---
