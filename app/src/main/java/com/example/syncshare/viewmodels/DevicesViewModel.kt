@@ -4,7 +4,6 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Application
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothSocket
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -17,6 +16,7 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.syncshare.data.SyncHistoryEntry
+import com.example.syncshare.communication.CommunicationHandler
 import com.example.syncshare.management.BluetoothConnectionManager
 import com.example.syncshare.management.WifiDirectManager
 import com.example.syncshare.protocol.FileMetadata
@@ -25,11 +25,8 @@ import com.example.syncshare.protocol.MessageType
 import com.example.syncshare.protocol.SyncMessage
 import com.example.syncshare.ui.model.DeviceTechnology
 import com.example.syncshare.ui.model.DisplayableDevice
-import com.example.syncshare.utils.AppConstants
 import com.example.syncshare.utils.getBluetoothBondState
 import com.example.syncshare.utils.getDeviceP2pStatusString
-import com.example.syncshare.utils.getWifiDirectPermissions
-import com.example.syncshare.utils.isLocationEnabled
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -40,17 +37,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.currentCoroutineContext
 import java.io.IOException
-import java.io.ObjectInputStream
-import java.io.ObjectOutputStream
-import java.net.ServerSocket
-import java.net.Socket
 import android.webkit.MimeTypeMap
 import android.content.SharedPreferences
 import android.content.Context
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
-import com.example.syncshare.utils.getFailureReasonString
-import com.example.syncshare.utils.getDetailedFailureReasonString
 import com.example.syncshare.utils.computeFileHash
 
 enum class CommunicationTechnology { BLUETOOTH, P2P }
@@ -92,12 +83,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     val pendingFolderMapping = mutableStateOf<String?>(null)
     var pendingSyncMessage: SyncMessage? = null
 
-    private var objectOutputStream: ObjectOutputStream? = null
-    private var objectInputStream: ObjectInputStream? = null
-    private var communicationJob: Job? = null
+    private var communicationHandler: CommunicationHandler? = null
+    private var messageListenerJob: Job? = null
     private var currentCommunicationTechnology: CommunicationTechnology? = null
-
-    private val outputStreamLock = Any()
 
     // --- Add at the top of DevicesViewModel class ---
     private var syncMetadataSentForSession = false
@@ -449,39 +437,41 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     // Rest of the methods are implemented in WifiDirectManager
 
     private suspend fun setupCommunicationStreams(socket: Any, technology: CommunicationTechnology) {
-        Log.d("DevicesViewModel", "Setting up communication streams for ${technology.name} socket.")
+        Log.d("DevicesViewModel", "Setting up communication handler for ${technology.name} socket.")
         try {
-            when (technology) {
-                CommunicationTechnology.BLUETOOTH -> {
-                    val btSocket = socket as BluetoothSocket
-                    objectOutputStream = ObjectOutputStream(btSocket.outputStream)
-                    objectInputStream = ObjectInputStream(btSocket.inputStream)
-                }
-                CommunicationTechnology.P2P -> {
-                    val p2pSocket = socket as Socket
-                    objectOutputStream = ObjectOutputStream(p2pSocket.getOutputStream())
-                    objectInputStream = ObjectInputStream(p2pSocket.inputStream)
-                }
+            // Clean up any existing handler
+            communicationHandler?.cleanup()
+            messageListenerJob?.cancel()
+            
+            Log.d("DevicesViewModel", "Setting up communication handler for ${technology.name}")
+            
+            // Create new communication handler
+            communicationHandler = CommunicationHandler(socket, viewModelScope)
+            
+            // Initialize the handler
+            val initialized = communicationHandler!!.initialize()
+            if (!initialized) {
+                throw IOException("Failed to initialize communication handler")
             }
-            objectOutputStream?.flush()
-            Log.i("DevicesViewModel", "Communication streams established for ${technology.name}.")
+            
+            Log.i("DevicesViewModel", "Communication handler established for ${technology.name}.")
             
             // Set current communication technology
             currentCommunicationTechnology = technology
             
             // Update UI on Main thread
             withContext(Dispatchers.Main) {
-                permissionRequestStatus.value = "Streams open. Ready to sync."
+                permissionRequestStatus.value = "Communication ready. Ready to sync."
             }
             
             startListeningForMessages()
 
         } catch (e: IOException) {
-            Log.e("DevicesViewModel", "Error setting up communication streams for ${technology.name}: ", e)
+            Log.e("DevicesViewModel", "Error setting up communication handler for ${technology.name}: ", e)
             
             // Update UI on Main thread
             withContext(Dispatchers.Main) {
-                permissionRequestStatus.value = "Error: Stream setup failed."
+                permissionRequestStatus.value = "Error: Communication setup failed."
             }
             
             if (technology == CommunicationTechnology.BLUETOOTH) {
@@ -493,40 +483,23 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun startListeningForMessages() {
-        communicationJob?.cancel()
-        communicationJob = viewModelScope.launch(Dispatchers.IO) {
-            Log.i("DevicesViewModel", "Listening for incoming SyncMessages...")
-            while (isActive && objectInputStream != null) {
-                try {
-                    val message = objectInputStream?.readObject() as? SyncMessage
-                    message?.let {
-                        Log.d("DevicesViewModel", "Received message: Type: ${it.type}, Folder: ${it.folderName}")
-                        handleIncomingMessage(it)
+        messageListenerJob?.cancel()
+        messageListenerJob = viewModelScope.launch {
+            Log.i("DevicesViewModel", "Starting to listen for incoming SyncMessages...")
+            
+            communicationHandler?.incomingMessages?.collect { message ->
+                Log.d("DevicesViewModel", "Received message: Type: ${message.type}, Folder: ${message.folderName}")
+                
+                // Handle connection error messages
+                if (message.type == MessageType.ERROR_MESSAGE && message.errorMessage?.contains("Connection lost") == true) {
+                    withContext(Dispatchers.Main) {
+                        permissionRequestStatus.value = message.errorMessage
                     }
-                } catch (e: IOException) {
-                    if (isActive) {
-                        Log.e("DevicesViewModel", "IOException while listening for messages: ${e.message}", e)
-                        launch(Dispatchers.Main) { permissionRequestStatus.value = "Connection lost: ${e.message}" }
-                        
-                        // Close communication streams and notify connection managers of the broken connection
-                        closeCommunicationStreams()
-                        
-                        // Disconnect from both technologies to ensure clean state
-                        if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
-                            bluetoothConnectionManager.notifyConnectionLost()
-                            disconnectBluetooth()
-                        } else if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
-                            disconnectP2p()
-                        }
-                        currentCommunicationTechnology = null
-                    }
-                    break
-                } catch (e: ClassNotFoundException) {
-                    Log.e("DevicesViewModel", "ClassNotFoundException while listening: ${e.message}", e)
-                    launch(Dispatchers.Main) { permissionRequestStatus.value = "Protocol error." }
                     
-                    // Protocol error suggests connection issues, disconnect cleanly
+                    // Close communication and notify connection managers of the broken connection
                     closeCommunicationStreams()
+                    
+                    // Disconnect from both technologies to ensure clean state
                     if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
                         bluetoothConnectionManager.notifyConnectionLost()
                         disconnectBluetooth()
@@ -534,33 +507,13 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         disconnectP2p()
                     }
                     currentCommunicationTechnology = null
-                    break
-                } catch (e: Exception) {
-                    if (isActive) {
-                        Log.e("DevicesViewModel", "Unexpected error listening for messages: ${e.message}", e)
-                        launch(Dispatchers.Main) { permissionRequestStatus.value = "Communication error."}
-                        
-                        // General communication error, disconnect cleanly
-                        closeCommunicationStreams()
-                        if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
-                            bluetoothConnectionManager.notifyConnectionLost()
-                            disconnectBluetooth()
-                        } else if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
-                            disconnectP2p()
-                        }
-                        currentCommunicationTechnology = null
-                    }
-                    break
+                    return@collect
                 }
+                
+                handleIncomingMessage(message)
             }
+            
             Log.i("DevicesViewModel", "Stopped listening for messages.")
-            if (bluetoothConnectionManager.connectedSocket.value != null || p2pIsConnected()) {
-                launch(Dispatchers.Main) {
-                    if (bluetoothConnectionStatus.value.startsWith("Connected")) {
-                        // Connection status will be updated by the connection manager
-                    }
-                }
-            }
         }
     }
 
@@ -590,28 +543,35 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         val localFiles = getLocalFileMetadata(localFolderUri)
                         val remoteFiles = message.fileMetadataList ?: emptyList()
                         val filesToRequest = mutableListOf<String>()
+                        val filesToSend = mutableListOf<String>()
                         val localFileMap = localFiles.associateBy { it.relativePath }
                         val remoteFileMap = remoteFiles.associateBy { it.relativePath }
                         val conflicts = mutableListOf<FileConflict>()
 
+                        // Check files that exist on remote but not local (need to request)
                         for ((remotePath, remoteMeta) in remoteFileMap) {
                             val localMeta = localFileMap[remotePath]
                             if (localMeta == null) {
                                 // File exists on remote but not local, request it
                                 filesToRequest.add(remotePath)
                             } else {
-                                // File exists on both, compare size first
-                                if (remoteMeta.size != localMeta.size) {
-                                    // Sizes differ, check hash
-                                    if (remoteMeta.hash != localMeta.hash) {
-                                        // Conflict detected: both exist, but content differs
-                                        conflicts.add(FileConflict(folderName ?: "", remotePath, localMeta, remoteMeta))
-                                    }
-
+                                // File exists on both, compare to detect conflicts
+                                if (remoteMeta.size != localMeta.size || remoteMeta.hash != localMeta.hash) {
+                                    // Conflict detected: both exist, but content differs
+                                    conflicts.add(FileConflict(folderName ?: "", remotePath, localMeta, remoteMeta))
                                 }
-                                // If sizes are the same, treat as identical, skip (even if hash/lastModified differ)
+                                // If sizes and hashes are the same, treat as identical, skip
                             }
                         }
+                        
+                        // Check files that exist locally but not on remote (need to send)
+                        for ((localPath, localMeta) in localFileMap) {
+                            if (!remoteFileMap.containsKey(localPath)) {
+                                // File exists locally but not on remote, we should send it
+                                filesToSend.add(localPath)
+                            }
+                        }
+                        
                         // --- Pause sync and show conflicts if any ---
                         if (conflicts.isNotEmpty()) {
                             _fileConflicts.value = conflicts
@@ -621,16 +581,40 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                             }
                             return@launch
                         }
-                        // --- No conflicts, proceed as before ---
-                        Log.d("DevicesViewModel", "Requesting ${filesToRequest.size} files for folder '${message.folderName}': $filesToRequest")
-                        sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = message.folderName, requestedFilePaths = filesToRequest))
-                        sendMessage(
-                            SyncMessage(
-                                type = MessageType.SYNC_REQUEST_METADATA,
-                                folderName = folderName,
-                                fileMetadataList = localFiles
-                            )
-                        )
+                        
+                        // --- Two-way sync: Request files we need AND send files they need ---
+                        Log.d("DevicesViewModel", "Two-way sync for folder '${message.folderName}': Requesting ${filesToRequest.size} files, Sending ${filesToSend.size} files")
+                        
+                        // First, request files that we need from remote
+                        if (filesToRequest.isNotEmpty()) {
+                            Log.d("DevicesViewModel", "Requesting files: $filesToRequest")
+                            sendMessage(SyncMessage(MessageType.FILES_REQUESTED_BY_PEER, folderName = message.folderName, requestedFilePaths = filesToRequest))
+                        }
+                        
+                        // Then, send files that remote needs from us
+                        if (filesToSend.isNotEmpty()) {
+                            Log.d("DevicesViewModel", "Sending files: $filesToSend")
+                            withContext(Dispatchers.Main) {
+                                permissionRequestStatus.value = "Sending ${filesToSend.size} files to peer..."
+                            }
+                            
+                            // Send each file
+                            filesToSend.forEach { relativePath ->
+                                if (currentCoroutineContext().isActive) {
+                                    sendFile(localFolderUri, relativePath, folderName ?: "")
+                                }
+                            }
+                        }
+                        
+                        // If neither device needs files, sync is complete
+                        if (filesToRequest.isEmpty() && filesToSend.isEmpty()) {
+                            Log.d("DevicesViewModel", "No files to sync - folders are already synchronized")
+                            sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = message.folderName))
+                            withContext(Dispatchers.Main) {
+                                _isRefreshing.value = false
+                                permissionRequestStatus.value = "Sync complete - folders are synchronized."
+                            }
+                        }
                     }
                 }
                 MessageType.FILES_REQUESTED_BY_PEER -> {
@@ -784,8 +768,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun initiateSyncRequest(folderUri: Uri) {
-        if (objectOutputStream == null) {
-            Log.e("DevicesViewModel", "Cannot initiate sync: Communication streams not ready.")
+        if (communicationHandler == null || !communicationHandler!!.isReady()) {
+            Log.e("DevicesViewModel", "Cannot initiate sync: Communication handler not ready.")
             permissionRequestStatus.value = "Error: Not connected for sync."
             val folderNameForHistory = DocumentFile.fromTreeUri(getApplication(), folderUri)?.name ?: folderUri.toString()
             _syncHistory.add(0, SyncHistoryEntry(folderName = folderNameForHistory, status = "Error", details = "Cannot initiate sync: Not connected."))
@@ -1120,36 +1104,38 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun closeCommunicationStreams() {
-        Log.d("DevicesViewModel", "Closing communication streams.")
-        communicationJob?.cancel()
-        communicationJob = null
-        try { objectInputStream?.close() } catch (e: IOException) { Log.w("DevicesViewModel", "Error closing objectInputStream: ${e.message}") }
-        try { objectOutputStream?.close() } catch (e: IOException) { Log.w("DevicesViewModel", "Error closing objectOutputStream: ${e.message}") }
-        objectInputStream = null
-        objectOutputStream = null
+        Log.d("DevicesViewModel", "Closing communication handler.")
+        messageListenerJob?.cancel()
+        messageListenerJob = null
+        communicationHandler?.cleanup()
+        communicationHandler = null
     }
 
     private fun sendMessage(message: SyncMessage) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                synchronized(outputStreamLock) {
-                    if (message.type == MessageType.FILE_CHUNK) {
-                        val chunk = message.fileChunkData
-                        Log.d("DevicesViewModel", "sendMessage: FILE_CHUNK, chunk size: ${chunk?.size}, first 8 bytes: ${chunk?.take(8)?.joinToString(" ") { String.format("%02x", it) }}, last 8 bytes: ${chunk?.takeLast(8)?.joinToString(" ") { String.format("%02x", it) }}")
-                        objectOutputStream?.reset()
-                    }
-                    objectOutputStream?.writeObject(message)
-                    objectOutputStream?.flush()
+                val handler = communicationHandler
+                if (handler == null || !handler.isReady()) {
+                    Log.w("DevicesViewModel", "Communication handler not ready, cannot send message")
+                    launch(Dispatchers.Main) { permissionRequestStatus.value = "Not connected." }
+                    return@launch
                 }
-                Log.d("DevicesViewModel", "Sent message: Type: ${message.type}, Folder: ${message.folderName}")
-            } catch (e: IOException) {
-                Log.e("DevicesViewModel", "Error sending message: ${e.message}", e)
+                
+                val success = handler.sendMessage(message)
+                if (!success) {
+                    Log.e("DevicesViewModel", "Failed to send message: Type: ${message.type}")
+                    launch(Dispatchers.Main) { permissionRequestStatus.value = "Error sending data." }
+                    if (message.type != MessageType.ERROR_MESSAGE) { // Avoid infinite error loops
+                        _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "N/A", status = "Error", details = "Failed to send message type ${message.type}"))
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("DevicesViewModel", "Exception sending message: ${e.message}", e)
                 launch(Dispatchers.Main) { permissionRequestStatus.value = "Error sending data." }
                 if (message.type != MessageType.ERROR_MESSAGE) { // Avoid infinite error loops
-                    _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "N/A", status = "Error", details = "Failed to send message type ${message.type}: ${e.message}"))
+                    _syncHistory.add(0, SyncHistoryEntry(folderName = message.folderName ?: "N/A", status = "Error", details = "Exception sending message type ${message.type}: ${e.message}"))
                 }
             }
-            _isRefreshing.value = false
         }
     }
 

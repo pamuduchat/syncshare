@@ -114,13 +114,12 @@ fun DevicesScreen(
                     } else { Log.w("DevicesScreen", "ON_RESUME: Wi-Fi Direct permissions MISSING.") }
 
                     if (viewModel.isBluetoothEnabled.value) {
-                        // Check Bluetooth permissions before starting server
+                        // Check Bluetooth permissions
                         val btPerms = getBluetoothPermissions()
                         if (btPerms.all { ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }) {
-                            Log.d("DevicesScreen", "ON_RESUME: Bluetooth permissions OK, preparing BT service.")
-                            viewModel.prepareBluetoothService() // This will start the BT server
+                            Log.d("DevicesScreen", "ON_RESUME: Bluetooth permissions OK.")
                         } else {
-                            Log.w("DevicesScreen", "ON_RESUME: Bluetooth permissions MISSING. BT Server not started.")
+                            Log.w("DevicesScreen", "ON_RESUME: Bluetooth permissions MISSING.")
                         }
                     } else {
                         Log.d("DevicesScreen", "ON_RESUME: Bluetooth is not enabled.")
