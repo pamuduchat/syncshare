@@ -106,7 +106,7 @@ fun SettingsScreen(
         // Diagnostics
         Text("Diagnostics & Advanced", style = MaterialTheme.typography.titleMedium)
         Button(onClick = {
-            diagnosticsText = devicesViewModel?.checkWifiDirectStatus() ?: "Diagnostics not available."
+            diagnosticsText = devicesViewModel?.getDiagnosticsInfo() ?: "Diagnostics not available."
             diagnosticsDialog = true
         }) {
             Text("Show Diagnostics")

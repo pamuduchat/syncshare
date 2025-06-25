@@ -479,11 +479,32 @@ class BluetoothConnectionManager(
         
         Log.i("BluetoothConnectionManager", "Handling accepted BT connection from $remoteDeviceName")
         
+        // Add the connected device to discovered devices if it's not already there
+        val currentDevices = _discoveredDevices.value.toMutableList()
+        if (!currentDevices.any { it.address == socket.remoteDevice.address }) {
+            Log.d("BluetoothConnectionManager", "Adding accepted connection device to discovered list: ${socket.remoteDevice.address}")
+            currentDevices.add(socket.remoteDevice)
+            _discoveredDevices.value = currentDevices
+        }
+        
         scope.launch(Dispatchers.Main) {
             _connectedSocket.value = socket
             _connectedDeviceAddress.value = socket.remoteDevice.address
             _connectionStatus.value = "Accepted connection from $remoteDeviceName"
             _statusMessage.value = "BT Peer connected: $remoteDeviceName"
+        }
+    }
+
+    /**
+     * Called by external components (like DevicesViewModel) when they detect a communication failure
+     */
+    fun notifyConnectionLost() {
+        Log.i("BluetoothConnectionManager", "External notification of connection loss")
+        scope.launch(Dispatchers.Main) {
+            _connectedSocket.value = null
+            _connectedDeviceAddress.value = null
+            _connectionStatus.value = "Disconnected"
+            _statusMessage.value = "Remote device disconnected"
         }
     }
 
@@ -508,4 +529,5 @@ class BluetoothConnectionManager(
             disconnect()
         }
     }
+
 }

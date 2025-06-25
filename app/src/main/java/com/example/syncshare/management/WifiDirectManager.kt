@@ -82,6 +82,11 @@ class WifiDirectManager(
     private var p2pDiscoveryTimeoutJob: Job? = null
     private val P2P_DISCOVERY_TIMEOUT_MS = 20000L
     
+    private var p2pConnectionRetryCount = 0
+    private val MAX_P2P_CONNECTION_RETRIES = 2
+    private var p2pConnectionTimeoutJob: Job? = null
+    private val P2P_CONNECTION_TIMEOUT_MS = 30000L // 30 seconds for connection attempts
+    
     private var p2pServerSocket: ServerSocket? = null
     private var p2pClientSocket: Socket? = null
     private var p2pServerJob: Job? = null
@@ -93,6 +98,18 @@ class WifiDirectManager(
             // Always register receiver after initialization
             delay(300)
             registerP2pReceiver()
+            
+            // Start periodic connection validation
+            startConnectionValidation()
+        }
+    }
+    
+    private fun startConnectionValidation() {
+        scope.launch {
+            while (isActive) {
+                delay(5000) // Check every 5 seconds
+                validateConnectionState()
+            }
         }
     }
     
@@ -338,45 +355,85 @@ class WifiDirectManager(
             return
         }
 
-        val config = WifiP2pConfig().apply {
-            deviceAddress = device.deviceAddress
-        }
-
         // Update UI immediately when user initiates connection
         _statusMessage.value = "Initiating connection to ${device.deviceName}..."
         _connectionStatus.value = "Connecting..."
         _connectedDeviceAddress.value = device.deviceAddress
+        
+        // Reset connection retry count for new connection attempt
+        p2pConnectionRetryCount = 0
+        
+        // Start connection timeout
+        p2pConnectionTimeoutJob?.cancel()
+        p2pConnectionTimeoutJob = scope.launch {
+            delay(P2P_CONNECTION_TIMEOUT_MS)
+            if (_connectionStatus.value.contains("Connecting") || _connectionStatus.value.contains("Group forming")) {
+                Log.w("WifiDirectManager", "Connection timeout reached for ${device.deviceName}")
+                withContext(Dispatchers.Main) {
+                    _statusMessage.value = "Connection timeout. Try disconnecting and retrying."
+                    _connectionStatus.value = "Connection timeout"
+                    _connectedDeviceAddress.value = null
+                }
+                p2pConnectionRetryCount = 0
+            }
+        }
+        
+        performConnectionAttempt(device)
+    }
+    
+    @SuppressLint("MissingPermission")
+    private fun performConnectionAttempt(device: WifiP2pDevice) {
+        val config = WifiP2pConfig().apply {
+            deviceAddress = device.deviceAddress
+        }
 
         try {
             wifiP2pManager?.connect(p2pChannel, config, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
                     Log.d("WifiDirectManager", "P2P connect SUCCESS to ${device.deviceName}")
                     _statusMessage.value = "Connection initiated to ${device.deviceName}..."
+                    p2pConnectionRetryCount = 0 // Reset on success
                     // Keep connection status as "Connecting..." until group is formed
                 }
 
                 override fun onFailure(reason: Int) {
                     Log.w("WifiDirectManager", "P2P connect FAILURE: ${getFailureReasonString(reason)}")
-                    _statusMessage.value = "P2P Connect failed: ${getFailureReasonString(reason)}"
-                    _connectionStatus.value = "Connection failed"
-                    _connectedDeviceAddress.value = null
+                    p2pConnectionRetryCount++
+                    
+                    if (p2pConnectionRetryCount <= MAX_P2P_CONNECTION_RETRIES) {
+                        Log.i("WifiDirectManager", "Retrying connection to ${device.deviceName} in 2 seconds... (attempt $p2pConnectionRetryCount)")
+                        _statusMessage.value = "Connection failed, retrying... (${p2pConnectionRetryCount}/${MAX_P2P_CONNECTION_RETRIES})"
+                        scope.launch {
+                            delay(2000)
+                            performConnectionAttempt(device)
+                        }
+                    } else {
+                        Log.e("WifiDirectManager", "P2P connection failed after $MAX_P2P_CONNECTION_RETRIES attempts")
+                        _statusMessage.value = "Connection failed after retries: ${getFailureReasonString(reason)}"
+                        _connectionStatus.value = "Connection failed"
+                        _connectedDeviceAddress.value = null
+                        p2pConnectionRetryCount = 0
+                    }
                 }
             })
         } catch (e: SecurityException) {
             Log.e("WifiDirectManager", "SecEx P2P connect: ${e.message}", e)
-            _statusMessage.value = "PermErr P2P connect."
+            _statusMessage.value = "Permission error during connection"
             _connectionStatus.value = "Permission error"
             _connectedDeviceAddress.value = null
+            p2pConnectionRetryCount = 0
         } catch (e: IllegalArgumentException) {
             Log.e("WifiDirectManager", "IllegalArg P2P connect: ${e.message}", e)
-            _statusMessage.value = "Invalid device for connection."
+            _statusMessage.value = "Invalid device for connection"
             _connectionStatus.value = "Invalid device"
             _connectedDeviceAddress.value = null
+            p2pConnectionRetryCount = 0
         } catch (e: Exception) {
             Log.e("WifiDirectManager", "Unexpected error during P2P connect: ${e.message}", e)
-            _statusMessage.value = "P2P Connect Error: ${e.message}"
+            _statusMessage.value = "Connection error: ${e.message}"
             _connectionStatus.value = "Connection error"
             _connectedDeviceAddress.value = null
+            p2pConnectionRetryCount = 0
         }
     }
     
@@ -385,7 +442,11 @@ class WifiDirectManager(
             try {
                 if (info.groupFormed) {
                     Log.i("WifiDirectManager", "P2P Group formed. Group owner: ${info.isGroupOwner}, Owner address: ${info.groupOwnerAddress}")
-                    _connectionStatus.value = "Group formed"
+                    
+                    // Cancel connection timeout since group is now formed
+                    p2pConnectionTimeoutJob?.cancel()
+                    
+                    _connectionStatus.value = "Group forming..." // Don't say "Connected" until socket is established
                     
                     // Request peers to get the actual connected device address
                     forceRequestPeersForConnection()
@@ -401,16 +462,18 @@ class WifiDirectManager(
                     }
                 } else {
                     Log.i("WifiDirectManager", "P2P Group NOT formed or disconnected.")
+                    p2pConnectionTimeoutJob?.cancel() // Cancel timeout on disconnect
                     _connectionStatus.value = "Disconnected"
                     _connectedSocket.value = null
                     _connectedDeviceAddress.value = null
                     _statusMessage.value = "P2P Group disconnected"
-                    disconnect()
+                    // Don't auto-disconnect, let timeout or user handle it
                 }
             } catch (e: Exception) {
                 Log.e("WifiDirectManager", "Error handling connection info: ${e.message}", e)
                 _statusMessage.value = "Error handling P2P connection"
                 _connectionStatus.value = "Connection error"
+                p2pConnectionTimeoutJob?.cancel()
             }
         }
     }
@@ -544,19 +607,105 @@ class WifiDirectManager(
         scope.launch(Dispatchers.IO) {
             Log.i("WifiDirectManager", "Disconnecting P2P...")
             
+            // Cancel any ongoing operations and timeouts
             p2pServerJob?.cancel()
             p2pServerJob = null
+            p2pDiscoveryTimeoutJob?.cancel()
+            p2pConnectionTimeoutJob?.cancel()
             
+            // Close all sockets immediately
             closeP2pSockets()
             
+            // Update UI state first
             withContext(Dispatchers.Main) {
                 _connectedSocket.value = null
                 _connectedDeviceAddress.value = null
-                _connectionStatus.value = "Disconnected"
-                _statusMessage.value = "P2P disconnected"
+                _connectionStatus.value = "Disconnecting..."
+                _statusMessage.value = "Disconnecting from P2P group..."
             }
             
-            Log.i("WifiDirectManager", "P2P disconnected.")
+            // Try to cancel any pending connections and remove group at system level
+            try {
+                if (wifiP2pManager != null && p2pChannel != null) {
+                    // Cancel any pending connection attempts
+                    wifiP2pManager?.cancelConnect(p2pChannel, object : WifiP2pManager.ActionListener {
+                        override fun onSuccess() {
+                            Log.d("WifiDirectManager", "cancelConnect SUCCESS during disconnect")
+                        }
+                        override fun onFailure(reason: Int) {
+                            Log.d("WifiDirectManager", "cancelConnect FAILURE (expected if no pending): ${getFailureReasonString(reason)}")
+                        }
+                    })
+                    
+                    // Small delay to let cancel complete
+                    delay(100)
+                    
+                    // Remove from P2P group
+                    wifiP2pManager?.removeGroup(p2pChannel, object : WifiP2pManager.ActionListener {
+                        override fun onSuccess() {
+                            Log.d("WifiDirectManager", "removeGroup SUCCESS during disconnect")
+                            scope.launch(Dispatchers.Main) {
+                                _connectionStatus.value = "Disconnected"
+                                _statusMessage.value = "P2P disconnected successfully"
+                            }
+                        }
+                        override fun onFailure(reason: Int) {
+                            Log.d("WifiDirectManager", "removeGroup FAILURE during disconnect: ${getFailureReasonString(reason)}")
+                            scope.launch(Dispatchers.Main) {
+                                _connectionStatus.value = "Disconnected"
+                                _statusMessage.value = "P2P disconnected (no group to remove)"
+                            }
+                        }
+                    })
+                } else {
+                    Log.w("WifiDirectManager", "P2P manager or channel null during disconnect")
+                    withContext(Dispatchers.Main) {
+                        _connectionStatus.value = "Disconnected"
+                        _statusMessage.value = "P2P disconnected (manager unavailable)"
+                    }
+                }
+            } catch (e: SecurityException) {
+                Log.e("WifiDirectManager", "SecurityException during P2P disconnect: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    _connectionStatus.value = "Disconnected"
+                    _statusMessage.value = "P2P disconnected (permission error)"
+                }
+            } catch (e: Exception) {
+                Log.e("WifiDirectManager", "Exception during P2P disconnect: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    _connectionStatus.value = "Disconnected"
+                    _statusMessage.value = "P2P disconnected (with errors)"
+                }
+            }
+            
+            Log.i("WifiDirectManager", "P2P disconnect sequence completed.")
+        }
+    }
+
+    // Validate current connection state and fix inconsistencies
+    private fun validateConnectionState() {
+        scope.launch(Dispatchers.IO) {
+            val currentSocket = _connectedSocket.value
+            val currentStatus = _connectionStatus.value
+            
+            // If we have a socket but it's closed/disconnected, clean up
+            if (currentSocket != null && (currentSocket.isClosed || !currentSocket.isConnected)) {
+                Log.w("WifiDirectManager", "Detected invalid socket connection, cleaning up...")
+                withContext(Dispatchers.Main) {
+                    _connectedSocket.value = null
+                    _connectedDeviceAddress.value = null
+                    _connectionStatus.value = "Disconnected"
+                    _statusMessage.value = "Connection lost"
+                }
+            }
+            // If status says connected but no socket, fix status
+            else if (currentSocket == null && currentStatus.contains("Connected")) {
+                Log.w("WifiDirectManager", "Status says connected but no socket, fixing status...")
+                withContext(Dispatchers.Main) {
+                    _connectionStatus.value = "Disconnected"
+                    _statusMessage.value = "No active connection"
+                }
+            }
         }
     }
     
@@ -625,34 +774,105 @@ class WifiDirectManager(
         Log.i("WifiDirectManager", "resetWifiDirectSystem CALLED")
         _statusMessage.value = "Resetting Wi-Fi Direct..."
         _isScanning.value = true
+        
+        // Cancel all timeout jobs and reset counters
         p2pDiscoveryTimeoutJob?.cancel()
+        p2pConnectionTimeoutJob?.cancel()
+        p2pDiscoveryRetryCount = 0
+        p2pConnectionRetryCount = 0
 
-        try {
-            if (p2pChannel != null && wifiP2pManager != null) {
-                wifiP2pManager?.stopPeerDiscovery(p2pChannel, null)
+        // First, ensure proper disconnection
+        scope.launch(Dispatchers.IO) {
+            // Cancel any ongoing operations
+            p2pServerJob?.cancel()
+            p2pServerJob = null
+            closeP2pSockets()
+            
+            // Clear connection state immediately
+            withContext(Dispatchers.Main) {
+                _connectedSocket.value = null
+                _connectedDeviceAddress.value = null
+                _connectionStatus.value = "Disconnected"
             }
-        } catch (e: SecurityException) {
-            Log.w("WifiDirectManager", "SecEx stopP2PDisc during reset: ${e.message}", e)
-        } catch (e: Exception) {
-            Log.w("WifiDirectManager", "Ex stopP2PDisc during reset: ${e.message}")
-        }
-        
-        unregisterP2pReceiver()
-        p2pChannel = null
-        _discoveredPeers.value = emptyList()
-        
-        scope.launch {
+
+            // Try to properly disconnect from P2P at system level
+            try {
+                if (p2pChannel != null && wifiP2pManager != null) {
+                    // Stop any discovery first
+                    try {
+                        wifiP2pManager?.stopPeerDiscovery(p2pChannel, null)
+                    } catch (e: SecurityException) {
+                        Log.w("WifiDirectManager", "SecEx stopP2PDisc during reset: ${e.message}")
+                    }
+                    
+                    // Cancel any pending connections
+                    wifiP2pManager?.cancelConnect(p2pChannel, object : WifiP2pManager.ActionListener {
+                        override fun onSuccess() {
+                            Log.d("WifiDirectManager", "cancelConnect SUCCESS during reset")
+                        }
+                        override fun onFailure(reason: Int) {
+                            Log.d("WifiDirectManager", "cancelConnect FAILURE during reset (expected): ${getFailureReasonString(reason)}")
+                        }
+                    })
+                    
+                    // Small delay before group removal
+                    delay(200)
+                    
+                    // Remove from any P2P group
+                    wifiP2pManager?.removeGroup(p2pChannel, object : WifiP2pManager.ActionListener {
+                        override fun onSuccess() {
+                            Log.d("WifiDirectManager", "removeGroup SUCCESS during reset")
+                        }
+                        override fun onFailure(reason: Int) {
+                            Log.d("WifiDirectManager", "removeGroup FAILURE during reset (expected if no group): ${getFailureReasonString(reason)}")
+                        }
+                    })
+                }
+            } catch (e: SecurityException) {
+                Log.w("WifiDirectManager", "SecurityException during reset cleanup: ${e.message}")
+            } catch (e: Exception) {
+                Log.w("WifiDirectManager", "Exception during reset cleanup: ${e.message}")
+            }
+            
+            // Unregister receiver and clean up
+            withContext(Dispatchers.Main) {
+                unregisterP2pReceiver()
+                p2pChannel = null
+                _discoveredPeers.value = emptyList()
+            }
+            
+            // Wait a bit before reinitializing
             delay(500)
-            initializeWifiP2p(isReset = true)
+            
+            // Reinitialize
+            withContext(Dispatchers.Main) {
+                initializeWifiP2p(isReset = true)
+            }
+            
+            // Wait for initialization and update status
             delay(300)
-            _statusMessage.value = if (p2pChannel != null) "P2P Reset complete. Try discovery." else "P2P Reset failed to re-init channel."
-            _isScanning.value = false
-            checkWifiDirectStatus()
+            withContext(Dispatchers.Main) {
+                val resetSuccess = p2pChannel != null
+                _statusMessage.value = if (resetSuccess) "P2P Reset complete. Ready for operations." else "P2P Reset failed to re-init channel."
+                _isScanning.value = false
+                
+                // Perform a diagnostic check to verify state
+                if (resetSuccess) {
+                    scope.launch { 
+                        delay(100)
+                        checkWifiDirectStatus() 
+                    }
+                }
+            }
         }
     }
     
     fun checkWifiDirectStatus(): String {
         Log.i("WifiDirectManager", "checkWifiDirectStatus CALLED")
+        
+        // Validate connection state first
+        validateConnectionState()
+        
         val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
         val isWifiEnabled = wifiManager?.isWifiEnabled == true
         val systemLocationEnabled = isLocationEnabled(context)
@@ -706,6 +926,22 @@ class WifiDirectManager(
         _statusMessage.value = "Idle. Ready for P2P operations."
     }
     
+    // Public method to check if P2P is connected
+    fun isConnected(): Boolean {
+        return _connectedSocket.value != null && _connectedSocket.value?.isConnected == true
+    }
+    
+    // Public method to get the current connection status string for UI
+    fun getConnectionStatusString(): String {
+        val socket = _connectedSocket.value
+        return when {
+            socket?.isConnected == true -> "Connected"
+            _connectionStatus.value.contains("Connecting") -> "Connecting"
+            _connectionStatus.value.contains("Group forming") -> "Connecting"
+            else -> "Disconnected"
+        }
+    }
+    
     private fun closeP2pClientSocket() {
         try {
             p2pClientSocket?.close()
@@ -733,6 +969,11 @@ class WifiDirectManager(
     
     fun cleanup() {
         Log.d("WifiDirectManager", "cleanup called.")
+        
+        // Cancel all timeout jobs
+        p2pDiscoveryTimeoutJob?.cancel()
+        p2pConnectionTimeoutJob?.cancel()
+        
         unregisterP2pReceiver()
         if (p2pChannel != null && wifiP2pManager != null) {
             try {
@@ -746,5 +987,24 @@ class WifiDirectManager(
         closeP2pSockets()
         p2pServerJob?.cancel()
         Log.d("WifiDirectManager", "cleanup finished.")
+    }
+    
+    // Simple method to restart discovery (clears old results first)
+    @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
+    fun restartDiscovery() {
+        Log.i("WifiDirectManager", "restartDiscovery() - Clearing previous results and starting fresh")
+        
+        // Cancel any ongoing discovery
+        p2pDiscoveryTimeoutJob?.cancel()
+        
+        // Clear previous results immediately
+        _discoveredPeers.value = emptyList()
+        _statusMessage.value = "Clearing previous results..."
+        
+        // Start fresh discovery after a short delay
+        scope.launch {
+            delay(500)
+            startDiscovery(isRetry = false)
+        }
     }
 }

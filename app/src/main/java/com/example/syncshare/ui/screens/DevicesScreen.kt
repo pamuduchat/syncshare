@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
@@ -181,7 +182,6 @@ fun DevicesScreen(
             modifier = Modifier.fillMaxWidth()
         )
 
-
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceAround,
@@ -228,24 +228,38 @@ fun DevicesScreen(
         }
 
         Spacer(modifier = Modifier.height(8.dp))
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceAround) {
-            OutlinedButton(onClick = { viewModel.resetWifiDirectSystem() }, enabled = !isRefreshing) {
-                Icon(Icons.Filled.Refresh, contentDescription = "Reset P2P", modifier = Modifier.size(ButtonDefaults.IconSize))
-                Spacer(Modifier.size(ButtonDefaults.IconSpacing))
-                Text("Reset P2P")
+        
+        // Connection Controls - Context-aware for both P2P and Bluetooth
+        // Use reactive state instead of direct function calls
+        val isP2pConnected = p2pConnectionStatus.contains("Connected")
+        val isBluetoothConnected = btConnectionStatus.contains("Connected")
+        
+        if (isP2pConnected || isBluetoothConnected) {
+            // Show disconnect options when connected
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                if (isP2pConnected) {
+                    OutlinedButton(onClick = { viewModel.disconnectP2p() }, enabled = !isRefreshing) {
+                        Icon(Icons.Filled.Close, contentDescription = "Disconnect P2P", modifier = Modifier.size(ButtonDefaults.IconSize))
+                        Spacer(Modifier.size(ButtonDefaults.IconSpacing))
+                        Text("Disconnect P2P")
+                    }
+                }
+                if (isBluetoothConnected) {
+                    OutlinedButton(onClick = { viewModel.disconnectBluetooth() }, enabled = !isRefreshing) {
+                        Icon(Icons.Filled.Close, contentDescription = "Disconnect Bluetooth", modifier = Modifier.size(ButtonDefaults.IconSize))
+                        Spacer(Modifier.size(ButtonDefaults.IconSpacing))
+                        Text("Disconnect BT")
+                    }
+                }
             }
-            OutlinedButton(onClick = { viewModel.checkWifiDirectStatus() }, enabled = !isRefreshing) {
-                Icon(Icons.Filled.Info, contentDescription = "Check P2P Status", modifier = Modifier.size(ButtonDefaults.IconSize))
-                Spacer(Modifier.size(ButtonDefaults.IconSpacing))
-                Text("P2P Status")
-            }
-        }
-
-        // --- New Row: P2P Disconnect Button ---
-        Spacer(modifier = Modifier.height(8.dp))
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-            OutlinedButton(onClick = { viewModel.fullResetP2pConnection() }, enabled = !isRefreshing) {
-                Text("Disconnect P2P")
+        } else {
+            // Show reset option when not connected
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                OutlinedButton(onClick = { viewModel.resetWifiDirectSystem() }, enabled = !isRefreshing) {
+                    Icon(Icons.Filled.Refresh, contentDescription = "Reset P2P", modifier = Modifier.size(ButtonDefaults.IconSize))
+                    Spacer(Modifier.size(ButtonDefaults.IconSpacing))
+                    Text("Reset P2P")
+                }
             }
         }
 

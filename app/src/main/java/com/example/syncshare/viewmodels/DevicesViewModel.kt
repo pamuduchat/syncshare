@@ -220,12 +220,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         
         viewModelScope.launch {
             bluetoothConnectionManager.connectedSocket.collect { socket ->
+                logConnectionState("BT Socket collect: ${socket != null}")
                 if (socket != null) {
-                    // Bluetooth connection established, switch from P2P if needed
-                    if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
-                        Log.d("DevicesViewModel", "Switching from P2P to BT. Closing P2P connection.")
-                        disconnectP2p()
-                    }
                     // Run socket setup on IO thread to avoid NetworkOnMainThreadException
                     launch(Dispatchers.IO) {
                         setupCommunicationStreams(socket, CommunicationTechnology.BLUETOOTH)
@@ -238,12 +234,17 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         peerDeviceName = peerAddress
                     ))
                     persistHistory()
+                    // Update device list to show connected status
+                    updateDisplayableDeviceList()
                 } else {
-                    // Bluetooth connection lost
+                    // Bluetooth connection lost - only clear if we're using Bluetooth
                     if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
                         closeCommunicationStreams()
                         currentCommunicationTechnology = null
+                        logConnectionState("BT disconnected and cleared")
                     }
+                    // Update device list to reflect disconnected status
+                    updateDisplayableDeviceList()
                 }
             }
         }
@@ -257,12 +258,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         
         viewModelScope.launch {
             wifiDirectManager.connectedSocket.collect { socket ->
+                logConnectionState("P2P Socket collect: ${socket != null}")
                 if (socket != null) {
-                    // P2P connection established, switch from Bluetooth if needed
-                    if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
-                        Log.d("DevicesViewModel", "Switching from BT to P2P. Closing BT connection.")
-                        bluetoothConnectionManager.disconnect()
-                    }
                     // Run socket setup on IO thread to avoid NetworkOnMainThreadException
                     launch(Dispatchers.IO) {
                         setupCommunicationStreams(socket, CommunicationTechnology.P2P)
@@ -278,10 +275,11 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     // Update device list when connection is established
                     updateDisplayableDeviceList()
                 } else {
-                    // P2P connection lost
+                    // P2P connection lost - only clear if we're using P2P
                     if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
                         closeCommunicationStreams()
                         currentCommunicationTechnology = null
+                        logConnectionState("P2P disconnected and cleared")
                     }
                     // Update device list when connection is lost
                     updateDisplayableDeviceList()
@@ -292,13 +290,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             wifiDirectManager.connectedDeviceAddress.collect { deviceAddress ->
                 // Update device list whenever connected device address changes
-                updateDisplayableDeviceList()
-            }
-        }
-        
-        viewModelScope.launch {
-            wifiDirectManager.connectedDeviceAddress.collect { deviceAddress ->
-                // Update device list when connection status changes
                 updateDisplayableDeviceList()
             }
         }
@@ -319,6 +310,12 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         updateDisplayableDeviceList()
         wifiDirectManager.startDiscovery()
     }
+    
+    @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
+    fun restartP2pDiscovery() {
+        updateDisplayableDeviceList()
+        wifiDirectManager.restartDiscovery()
+    }
 
     fun connectToP2pDevice(device: com.example.syncshare.ui.model.DisplayableDevice) {
         val p2pDevice = device.originalDeviceObject as? android.net.wifi.p2p.WifiP2pDevice
@@ -329,23 +326,35 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    // Simplified P2P control - only keep essential user-facing functions
     fun resetWifiDirectSystem() = wifiDirectManager.resetWifiDirectSystem()
     
-    fun checkWifiDirectStatus(): String = wifiDirectManager.checkWifiDirectStatus()
+    // P2P disconnection is delegated to WifiDirectManager
+    fun disconnectP2p() {
+        wifiDirectManager.disconnect()
+    }
     
-    @RequiresPermission(Manifest.permission.ACCESS_FINE_LOCATION)
-    fun forceRequestPeers() = wifiDirectManager.forceRequestPeers()
-    
-    fun fullResetP2pConnection() = wifiDirectManager.fullReset()
+    // Helper function to determine if P2P is connected
+    fun isP2pConnected(): Boolean = wifiDirectManager.isConnected()
+
+    // Helper function to determine if Bluetooth is connected
+    fun isBluetoothConnected(): Boolean = bluetoothConnectionManager.connectedSocket.value != null
+
+    // Get diagnostics information
+    fun getDiagnosticsInfo(): String = wifiDirectManager.checkWifiDirectStatus()
 
     // --- Bluetooth Methods - Delegated to BluetoothConnectionManager ---
     fun startBluetoothDiscovery() = bluetoothConnectionManager.startDiscovery()
     
     fun stopBluetoothDiscovery() = bluetoothConnectionManager.stopDiscovery()
 
-    fun connectToBluetoothDevice(device: BluetoothDevice) = bluetoothConnectionManager.connectToDevice(device)
+    fun connectToBluetoothDevice(device: BluetoothDevice) {
+        bluetoothConnectionManager.connectToDevice(device)
+    }
 
-    fun disconnectBluetooth() = bluetoothConnectionManager.disconnect()
+    fun disconnectBluetooth() {
+        bluetoothConnectionManager.disconnect()
+    }
 
     fun startBluetoothServer() = bluetoothConnectionManager.startServer()
 
@@ -359,10 +368,20 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     private fun updateDisplayableDeviceList() {
         val p2pPeers = wifiDirectManager.discoveredPeers.value
         val connectedP2pDeviceAddress = wifiDirectManager.connectedDeviceAddress.value
-        val bluetoothDevices = bluetoothConnectionManager.discoveredDevices.value
+        val bluetoothDevices = bluetoothConnectionManager.discoveredDevices.value.toMutableList()
         val connectedBluetoothDeviceAddress = bluetoothConnectionManager.connectedDeviceAddress.value
+        val connectedBluetoothSocket = bluetoothConnectionManager.connectedSocket.value
         
         Log.d("DevicesViewModel", "updateDisplayableDeviceList. P2P(manager): ${p2pPeers.size}, BT(manager): ${bluetoothDevices.size}, Connected P2P: $connectedP2pDeviceAddress, Connected BT: $connectedBluetoothDeviceAddress")
+        
+        // Add connected Bluetooth device to the list if it's not already there
+        if (connectedBluetoothSocket != null && connectedBluetoothDeviceAddress != null) {
+            val connectedDevice = connectedBluetoothSocket.remoteDevice
+            if (!bluetoothDevices.any { it.address == connectedBluetoothDeviceAddress }) {
+                Log.d("DevicesViewModel", "Adding connected BT device to discovered list: ${connectedBluetoothDeviceAddress}")
+                bluetoothDevices.add(connectedDevice)
+            }
+        }
         
         val newList = mutableListOf<DisplayableDevice>()
         val context = getApplication<Application>().applicationContext
@@ -447,6 +466,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             objectOutputStream?.flush()
             Log.i("DevicesViewModel", "Communication streams established for ${technology.name}.")
             
+            // Set current communication technology
+            currentCommunicationTechnology = technology
+            
             // Update UI on Main thread
             withContext(Dispatchers.Main) {
                 permissionRequestStatus.value = "Streams open. Ready to sync."
@@ -485,16 +507,48 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     if (isActive) {
                         Log.e("DevicesViewModel", "IOException while listening for messages: ${e.message}", e)
                         launch(Dispatchers.Main) { permissionRequestStatus.value = "Connection lost: ${e.message}" }
+                        
+                        // Close communication streams and notify connection managers of the broken connection
+                        closeCommunicationStreams()
+                        
+                        // Disconnect from both technologies to ensure clean state
+                        if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
+                            bluetoothConnectionManager.notifyConnectionLost()
+                            disconnectBluetooth()
+                        } else if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
+                            disconnectP2p()
+                        }
+                        currentCommunicationTechnology = null
                     }
                     break
                 } catch (e: ClassNotFoundException) {
                     Log.e("DevicesViewModel", "ClassNotFoundException while listening: ${e.message}", e)
                     launch(Dispatchers.Main) { permissionRequestStatus.value = "Protocol error." }
+                    
+                    // Protocol error suggests connection issues, disconnect cleanly
+                    closeCommunicationStreams()
+                    if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
+                        bluetoothConnectionManager.notifyConnectionLost()
+                        disconnectBluetooth()
+                    } else if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
+                        disconnectP2p()
+                    }
+                    currentCommunicationTechnology = null
                     break
                 } catch (e: Exception) {
                     if (isActive) {
                         Log.e("DevicesViewModel", "Unexpected error listening for messages: ${e.message}", e)
                         launch(Dispatchers.Main) { permissionRequestStatus.value = "Communication error."}
+                        
+                        // General communication error, disconnect cleanly
+                        closeCommunicationStreams()
+                        if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
+                            bluetoothConnectionManager.notifyConnectionLost()
+                            disconnectBluetooth()
+                        } else if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
+                            disconnectP2p()
+                        }
+                        currentCommunicationTechnology = null
                     }
                     break
                 }
@@ -665,10 +719,11 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 }
                 MessageType.DISCONNECT -> {
                     permissionRequestStatus.value = "Peer disconnected."
-                    // Close the P2P connection if still open
+                    // Close the communication and disconnect
                     viewModelScope.launch(Dispatchers.IO) {
                         closeCommunicationStreams()
                         disconnectP2p()
+                        disconnectBluetooth()
                         withContext(Dispatchers.Main) {
                             _isRefreshing.value = false
                         }
@@ -681,9 +736,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     // The connected socket is automatically handled via the StateFlow collection in init{}
     // Bluetooth connection handling is now managed by BluetoothConnectionManager
     // The connected socket is automatically handled via the StateFlow collection in init{}
-
-    // P2P disconnection is delegated to WifiDirectManager
-    fun disconnectP2p() = wifiDirectManager.disconnect()
 
     // --- SAF Integrated File Handling ---
     private fun getLocalFileMetadata(folderUri: Uri): List<FileMetadata> {
@@ -1098,7 +1150,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
             _isRefreshing.value = false
-            checkWifiDirectStatus() // Log current status after reset
         }
     }
 
@@ -1128,5 +1179,36 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     fun clearHistory() {
         _syncHistory.clear()
         persistHistory()
+    }
+
+    // Helper functions for debugging connection state
+    private fun logConnectionState(context: String) {
+        Log.d("DevicesViewModel", "$context - Current tech: $currentCommunicationTechnology")
+    }
+
+    // Helper function to disconnect all connections
+    fun disconnectAll() {
+        Log.d("DevicesViewModel", "Disconnecting all connections")
+        if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
+            disconnectBluetooth()
+        } else if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
+            disconnectP2p()
+        }
+        currentCommunicationTechnology = null
+        permissionRequestStatus.value = "All connections disconnected."
+    }
+    
+    // Helper function to check if any connection is active
+    fun hasActiveConnection(): Boolean {
+        return currentCommunicationTechnology != null
+    }
+    
+    // Helper function to get current connection type
+    fun getCurrentConnectionType(): String {
+        return when (currentCommunicationTechnology) {
+            CommunicationTechnology.BLUETOOTH -> "Bluetooth"
+            CommunicationTechnology.P2P -> "Wi-Fi P2P" 
+            null -> "None"
+        }
     }
 }
