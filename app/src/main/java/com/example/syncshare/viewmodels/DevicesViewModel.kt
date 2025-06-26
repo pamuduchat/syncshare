@@ -1000,10 +1000,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             }
         }
     }
-    // P2P connection handling is now managed by WifiDirectManager
-    // The connected socket is automatically handled via the StateFlow collection in init{}
-    // Bluetooth connection handling is now managed by BluetoothConnectionManager
-    // The connected socket is automatically handled via the StateFlow collection in init{}
 
     // --- SAF Integrated File Handling ---
     private fun getLocalFileMetadata(folderUri: Uri): List<FileMetadata> {
@@ -1249,7 +1245,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         val context = getApplication<Application>().applicationContext
         permissionRequestStatus.value = "Set '${DocumentFile.fromTreeUri(context,destinationUri)?.name ?: destinationUri}' as destination for syncs named '$folderName'."
         Log.d("DevicesViewModel", "Destination URI for sync folder '$folderName' set to '$destinationUri'. Current map: ${_activeSyncDestinationUris.value}")
-        // --- Also add to ManageFoldersViewModel for future syncs ---
+        // add to ManageFoldersViewModel for future syncs 
         manageFoldersViewModel?.addFolder(destinationUri)
     }
 
@@ -1468,7 +1464,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         Log.d("DevicesViewModel", "onCleared finished.")
     }
 
-    // Add a public function to retry pending sync after folder mapping
     fun retryPendingSyncIfNeeded() {
         val msg = pendingSyncMessage
         if (msg != null && pendingFolderMapping.value == null) {
