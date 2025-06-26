@@ -4,6 +4,7 @@ import java.io.Serializable
 
 enum class MessageType : Serializable {
     SYNC_REQUEST_METADATA, // Client sends its list of files in a folder
+    SYNC_METADATA_RESPONSE, // Server responds with its own list of files for two-way sync
     FILES_REQUESTED_BY_PEER, // Server responds with list of files it needs
     FILE_TRANSFER_START,     // Client indicates start of a file transfer
     FILE_CHUNK,              // A chunk of file data

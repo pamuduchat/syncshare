@@ -145,6 +145,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     private fun processConflictResolutions(folderName: String) {
         viewModelScope.launch(Dispatchers.IO) {
             val filesToRequest = mutableListOf<String>()
+            val additionalFilesToSend = mutableListOf<String>()
             val localFolderUri = _activeSyncDestinationUris.value[folderName]
             
             if (localFolderUri == null) {
@@ -156,8 +157,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             for ((relativePath, resolution) in conflictResolutions) {
                 when (resolution) {
                     ConflictResolutionOption.KEEP_LOCAL -> {
-                        // Do nothing, keep local file as is
-                        Log.d("DevicesViewModel", "Keeping local version of $relativePath")
+                        // Keep local file and send it to remote (since they differ)
+                        additionalFilesToSend.add(relativePath)
+                        Log.d("DevicesViewModel", "Keeping local version of $relativePath and will send to remote")
                     }
                     ConflictResolutionOption.USE_REMOTE -> {
                         // Request the remote file to overwrite local
@@ -165,8 +167,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         Log.d("DevicesViewModel", "Will request remote version of $relativePath")
                     }
                     ConflictResolutionOption.KEEP_BOTH -> {
-                        // For KEEP_BOTH, we request the file normally but mark it for renaming
+                        // For KEEP_BOTH, we request the remote file (for renaming) AND send our local file
                         filesToRequest.add(relativePath)
+                        additionalFilesToSend.add(relativePath)
                         
                         // Generate the rename target
                         val extension = relativePath.substringAfterLast('.', "")
@@ -179,7 +182,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         
                         // Store the rename mapping for later use
                         fileRenameMap[relativePath] = newName
-                        Log.d("DevicesViewModel", "Will request remote version of $relativePath and save as $newName")
+                        Log.d("DevicesViewModel", "Will request remote version of $relativePath and save as $newName, and send local version to remote")
                     }
                     ConflictResolutionOption.SKIP -> {
                         // Do nothing with this file
@@ -194,9 +197,16 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 // Add the original non-conflicting files to the request list
                 filesToRequest.addAll(syncState.filesToRequest)
                 
+                // Add the original non-conflicting files to send, plus conflict resolution files
+                val allFilesToSend = syncState.filesToSend.toMutableList()
+                allFilesToSend.addAll(additionalFilesToSend)
+                
                 Log.d("DevicesViewModel", "Resuming two-way sync after conflict resolution:")
-                Log.d("DevicesViewModel", "- Requesting ${filesToRequest.size} files (${conflictResolutions.size} from conflicts + ${syncState.filesToRequest.size} non-conflicting)")
-                Log.d("DevicesViewModel", "- Sending ${syncState.filesToSend.size} files")
+                Log.d("DevicesViewModel", "- Original filesToRequest: ${syncState.filesToRequest}")
+                Log.d("DevicesViewModel", "- Original filesToSend: ${syncState.filesToSend}")
+                Log.d("DevicesViewModel", "- Additional files to send from conflicts: $additionalFilesToSend")
+                Log.d("DevicesViewModel", "- Final requesting ${filesToRequest.size} files: $filesToRequest")
+                Log.d("DevicesViewModel", "- Final sending ${allFilesToSend.size} files: $allFilesToSend")
                 
                 // Request all files we need (conflict resolutions + non-conflicting)
                 if (filesToRequest.isNotEmpty()) {
@@ -204,13 +214,17 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 }
                 
                 // Send files that remote needs from us
-                if (syncState.filesToSend.isNotEmpty()) {
+                if (allFilesToSend.isNotEmpty()) {
                     withContext(Dispatchers.Main) {
-                        permissionRequestStatus.value = "Sending ${syncState.filesToSend.size} files to peer..."
+                        permissionRequestStatus.value = "Sending ${allFilesToSend.size} files to peer..."
                     }
                     
+                    // Create sync session to track our file sends
+                    currentSyncSession = SyncSession(folderName, allFilesToSend.size)
+                    Log.d("DevicesViewModel", "Created sync session for sending ${allFilesToSend.size} files after conflict resolution")
+                    
                     // Send each file
-                    syncState.filesToSend.forEach { relativePath ->
+                    allFilesToSend.forEach { relativePath ->
                         if (currentCoroutineContext().isActive) {
                             sendFile(syncState.localFolderUri, relativePath, folderName)
                         }
@@ -218,7 +232,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 }
                 
                 // If neither device needs files after conflict resolution, sync is complete
-                if (filesToRequest.isEmpty() && syncState.filesToSend.isEmpty()) {
+                if (filesToRequest.isEmpty() && allFilesToSend.isEmpty()) {
                     Log.d("DevicesViewModel", "No files to sync after conflict resolution - folders are synchronized")
                     sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = folderName))
                     withContext(Dispatchers.Main) {
@@ -249,18 +263,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     
     // Map to track file renames for KEEP_BOTH option
     private var fileRenameMap = mutableMapOf<String, String>()
-    
-    // Clear all conflicts (for testing or if user wants to cancel conflict resolution)
-    fun clearAllConflicts() {
-        _fileConflicts.value = emptyList()
-        conflictResolutions = emptyMap()
-        fileRenameMap.clear()
-        pendingSyncState = null
-        currentSyncSession = null
-        pendingFileSends.clear()
-        _isRefreshing.value = false
-        permissionRequestStatus.value = "Conflicts cleared. Ready to sync."
-    }
 
     private val prefs: SharedPreferences = application.getSharedPreferences("syncshare_prefs", Context.MODE_PRIVATE)
     private val KEY_HISTORY = "sync_history"
@@ -427,12 +429,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         updateDisplayableDeviceList()
         wifiDirectManager.startDiscovery()
     }
-    
-    @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
-    fun restartP2pDiscovery() {
-        updateDisplayableDeviceList()
-        wifiDirectManager.restartDiscovery()
-    }
 
     fun connectToP2pDevice(device: com.example.syncshare.ui.model.DisplayableDevice) {
         val p2pDevice = device.originalDeviceObject as? android.net.wifi.p2p.WifiP2pDevice
@@ -450,12 +446,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     fun disconnectP2p() {
         wifiDirectManager.disconnect()
     }
-    
-    // Helper function to determine if P2P is connected
-    fun isP2pConnected(): Boolean = wifiDirectManager.isConnected()
-
-    // Helper function to determine if Bluetooth is connected
-    fun isBluetoothConnected(): Boolean = bluetoothConnectionManager.connectedSocket.value != null
 
     // Get diagnostics information
     fun getDiagnosticsInfo(): String = wifiDirectManager.checkWifiDirectStatus()
@@ -473,12 +463,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         bluetoothConnectionManager.disconnect()
     }
 
-    fun startBluetoothServer() = bluetoothConnectionManager.startServer()
-
     fun stopBluetoothServer() = bluetoothConnectionManager.stopServer()
-
-    fun prepareBluetoothService() = bluetoothConnectionManager.prepareService()
-
 
     // --- Unified List & Helpers ---
     @SuppressLint("MissingPermission")
@@ -646,11 +631,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun p2pIsConnected(): Boolean {
-        return wifiDirectManager.connectedSocket.value != null
-    }
-
-
     private fun handleIncomingMessage(message: SyncMessage) {
         viewModelScope.launch(Dispatchers.Main) {
             when (message.type) {
@@ -676,6 +656,16 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         val localFileMap = localFiles.associateBy { it.relativePath }
                         val remoteFileMap = remoteFiles.associateBy { it.relativePath }
                         val conflicts = mutableListOf<FileConflict>()
+
+                        Log.d("DevicesViewModel", "Receiver comparison: Local has ${localFiles.size} files, Remote has ${remoteFiles.size} files")
+
+                        // First, send our file list back to the initiator so they can also do two-way sync
+                        Log.d("DevicesViewModel", "Sending file list back to initiator for two-way sync")
+                        sendMessage(SyncMessage(
+                            type = MessageType.SYNC_METADATA_RESPONSE, 
+                            folderName = folderName,
+                            fileMetadataList = localFiles
+                        ))
 
                         // Check files that exist on remote but not local (need to request)
                         for ((remotePath, remoteMeta) in remoteFileMap) {
@@ -715,6 +705,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                                 // File exists locally but not on remote, we should send it
                                 filesToSend.add(localPath)
                             }
+                            // Note: Files that exist on both sides but are different (conflicts) 
+                            // are handled separately through conflict resolution
                         }
                         
                         // --- Pause sync and show conflicts if any ---
@@ -754,6 +746,10 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                                 permissionRequestStatus.value = "Sending ${filesToSend.size} files to peer..."
                             }
                             
+                            // Create sync session to track our file sends
+                            currentSyncSession = SyncSession(folderName ?: "", filesToSend.size)
+                            Log.d("DevicesViewModel", "Created sync session for sending ${filesToSend.size} files")
+                            
                             // Send each file
                             filesToSend.forEach { relativePath ->
                                 if (currentCoroutineContext().isActive) {
@@ -769,6 +765,79 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                             withContext(Dispatchers.Main) {
                                 _isRefreshing.value = false
                                 permissionRequestStatus.value = "Sync complete - folders are synchronized."
+                            }
+                        }
+                    }
+                }
+                MessageType.SYNC_METADATA_RESPONSE -> {
+                    Log.d("DevicesViewModel", "Received SYNC_METADATA_RESPONSE for folder: ${message.folderName}")
+                    // This is received by the sync initiator to enable two-way sync
+                    val folderName = message.folderName
+                    val localFolderUri = _activeSyncDestinationUris.value[folderName]
+                    
+                    if (localFolderUri == null) {
+                        Log.e("DevicesViewModel", "Cannot process metadata response: No URI for folder $folderName")
+                        return@launch
+                    }
+                    
+                    launch(Dispatchers.IO) {
+                        val localFiles = getLocalFileMetadata(localFolderUri)
+                        val remoteFiles = message.fileMetadataList ?: emptyList()
+                        val filesToSend = mutableListOf<String>()
+                        val localFileMap = localFiles.associateBy { it.relativePath }
+                        val remoteFileMap = remoteFiles.associateBy { it.relativePath }
+                        
+                        Log.d("DevicesViewModel", "Initiator comparison: Local has ${localFiles.size} files, Remote has ${remoteFiles.size} files")
+                        
+                        // Check files that exist locally but not on remote (need to send)
+                        for ((localPath, localMeta) in localFileMap) {
+                            if (!remoteFileMap.containsKey(localPath)) {
+                                // File exists locally but not on remote, we should send it
+                                filesToSend.add(localPath)
+                                Log.d("DevicesViewModel", "Will send file $localPath (exists locally but not on remote)")
+                            } else {
+                                // File exists on both - check for differences
+                                val remoteMeta = remoteFileMap[localPath]!!
+                                val sizesDifferent = remoteMeta.size != localMeta.size
+                                val hashesDifferent = if (remoteMeta.hash != null && localMeta.hash != null) {
+                                    remoteMeta.hash != localMeta.hash
+                                } else {
+                                    false
+                                }
+                                
+                                val hasContentDifference = sizesDifferent || hashesDifferent
+                                
+                                if (hasContentDifference) {
+                                    // Files are different - let the receiver handle conflict resolution
+                                    // Don't send conflicted files automatically from initiator
+                                    Log.d("DevicesViewModel", "File $localPath differs between devices - receiver will handle conflict resolution")
+                                } else {
+                                    Log.d("DevicesViewModel", "File $localPath is identical on both devices")
+                                }
+                            }
+                        }
+                        
+                        // Send files that remote needs from us
+                        if (filesToSend.isNotEmpty()) {
+                            Log.d("DevicesViewModel", "Initiator sending ${filesToSend.size} files: $filesToSend")
+                            withContext(Dispatchers.Main) {
+                                permissionRequestStatus.value = "Sending ${filesToSend.size} files to peer..."
+                            }
+                            
+                            // Create sync session to track our file sends
+                            currentSyncSession = SyncSession(folderName ?: "", filesToSend.size)
+                            Log.d("DevicesViewModel", "Created sync session for sending ${filesToSend.size} files from initiator")
+                            
+                            // Send each file
+                            filesToSend.forEach { relativePath ->
+                                if (currentCoroutineContext().isActive) {
+                                    sendFile(localFolderUri, relativePath, folderName ?: "")
+                                }
+                            }
+                        } else {
+                            Log.d("DevicesViewModel", "Initiator has no files to send")
+                            withContext(Dispatchers.Main) {
+                                permissionRequestStatus.value = "Waiting for peer to complete sync..."
                             }
                         }
                     }
@@ -1184,13 +1253,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         manageFoldersViewModel?.addFolder(destinationUri)
     }
 
-    fun setDefaultIncomingUri(uri: Uri) {
-        defaultIncomingFolderUri = uri
-        val context = getApplication<Application>().applicationContext
-        permissionRequestStatus.value = "Default incoming folder set to '${DocumentFile.fromTreeUri(context, uri)?.name ?: uri}'."
-        Log.i("DevicesViewModel", "Default incoming URI set to $uri")
-    }
-
     private var currentReceivingFile: FileTransferState? = null
     private var currentFileOutputStream: java.io.OutputStream? = null
 
@@ -1240,7 +1302,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
                 var targetDocFile = parentDocFile?.findFile(fileName)
                 if (targetDocFile == null) {
-                    // --- Use correct MIME type ---
                     val extension = fileName.substringAfterLast('.', "")
                     val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension.lowercase()) ?: "application/octet-stream"
                     targetDocFile = parentDocFile?.createFile(mimeType, fileName)
@@ -1427,31 +1488,5 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     // Helper functions for debugging connection state
     private fun logConnectionState(context: String) {
         Log.d("DevicesViewModel", "$context - Current tech: $currentCommunicationTechnology")
-    }
-
-    // Helper function to disconnect all connections
-    fun disconnectAll() {
-        Log.d("DevicesViewModel", "Disconnecting all connections")
-        if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
-            disconnectBluetooth()
-        } else if (currentCommunicationTechnology == CommunicationTechnology.P2P) {
-            disconnectP2p()
-        }
-        currentCommunicationTechnology = null
-        permissionRequestStatus.value = "All connections disconnected."
-    }
-    
-    // Helper function to check if any connection is active
-    fun hasActiveConnection(): Boolean {
-        return currentCommunicationTechnology != null
-    }
-    
-    // Helper function to get current connection type
-    fun getCurrentConnectionType(): String {
-        return when (currentCommunicationTechnology) {
-            CommunicationTechnology.BLUETOOTH -> "Bluetooth"
-            CommunicationTechnology.P2P -> "Wi-Fi P2P" 
-            null -> "None"
-        }
     }
 }
