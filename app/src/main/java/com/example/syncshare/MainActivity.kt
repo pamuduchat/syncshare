@@ -49,7 +49,7 @@ import androidx.compose.ui.unit.dp
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import com.example.syncshare.viewmodels.DevicesViewModel.ConflictResolutionOption
+import com.example.syncshare.sync.SyncManager
 
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
@@ -207,7 +207,7 @@ fun ConflictResolutionDialog(devicesViewModel: DevicesViewModel) {
         val remote = conflict.remote
         val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()) }
         AlertDialog(
-            onDismissRequest = { devicesViewModel.resolveFileConflict(conflict, ConflictResolutionOption.SKIP) },
+            onDismissRequest = { devicesViewModel.resolveFileConflict(conflict, SyncManager.ConflictResolutionOption.SKIP) },
             title = { Text("File Conflict Detected") },
             text = {
                 Column {
@@ -241,22 +241,22 @@ fun ConflictResolutionDialog(devicesViewModel: DevicesViewModel) {
             },
             confirmButton = {
                 Row {
-                    Button(onClick = { devicesViewModel.resolveFileConflict(conflict, ConflictResolutionOption.KEEP_LOCAL) }) {
+                    Button(onClick = { devicesViewModel.resolveFileConflict(conflict, SyncManager.ConflictResolutionOption.KEEP_LOCAL) }) {
                         Text("Keep Local")
                     }
                     Spacer(Modifier.width(8.dp))
-                    Button(onClick = { devicesViewModel.resolveFileConflict(conflict, ConflictResolutionOption.USE_REMOTE) }) {
+                    Button(onClick = { devicesViewModel.resolveFileConflict(conflict, SyncManager.ConflictResolutionOption.USE_REMOTE) }) {
                         Text("Use Remote")
                     }
                 }
             },
             dismissButton = {
                 Column {
-                    OutlinedButton(onClick = { devicesViewModel.resolveFileConflict(conflict, ConflictResolutionOption.KEEP_BOTH) }) {
+                    OutlinedButton(onClick = { devicesViewModel.resolveFileConflict(conflict, SyncManager.ConflictResolutionOption.KEEP_BOTH) }) {
                         Text("Keep Both")
                     }
                     Spacer(Modifier.height(4.dp))
-                    OutlinedButton(onClick = { devicesViewModel.resolveFileConflict(conflict, ConflictResolutionOption.SKIP) }) {
+                    OutlinedButton(onClick = { devicesViewModel.resolveFileConflict(conflict, SyncManager.ConflictResolutionOption.SKIP) }) {
                         Text("Skip")
                     }
                 }

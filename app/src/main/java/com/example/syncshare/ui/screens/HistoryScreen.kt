@@ -5,6 +5,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -17,7 +19,7 @@ fun HistoryScreen(
     modifier: Modifier = Modifier,
     devicesViewModel: DevicesViewModel
 ) {
-    val syncHistory = devicesViewModel.syncHistory
+    val syncHistoryList by devicesViewModel.syncHistory.collectAsState()
     val showDialog = remember { mutableStateOf(false) }
     Column(
         modifier = modifier.fillMaxSize().padding(16.dp),
@@ -30,17 +32,17 @@ fun HistoryScreen(
             Text("Sync History", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
             Button(
                 onClick = { showDialog.value = true },
-                enabled = syncHistory.isNotEmpty()
+                enabled = syncHistoryList.isNotEmpty()
             ) {
                 Text("Clear History")
             }
         }
         Spacer(modifier = Modifier.height(8.dp))
-        if (syncHistory.isEmpty()) {
+        if (syncHistoryList.isEmpty()) {
             Text("No sync history yet.")
         } else {
             LazyColumn(modifier = Modifier.fillMaxWidth().weight(1f, fill = false)) {
-                items(syncHistory) { entry ->
+                items(syncHistoryList) { entry ->
                     Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                         Column(modifier = Modifier.padding(8.dp)) {
                             Text(entry.formattedTimestamp, style = MaterialTheme.typography.labelSmall)
