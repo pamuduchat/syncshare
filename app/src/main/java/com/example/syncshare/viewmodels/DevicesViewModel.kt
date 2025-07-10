@@ -111,6 +111,15 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             return
         }
         
+        // Check if we're already processing a sync
+        if (syncManager.isActive.value) {
+            permissionRequestStatus.value = "Sync already in progress, please wait..."
+            return
+        }
+        
+        // Clear any previous file transfer state for new sync session
+        fileTransferManager.clearProcessedFiles()
+        
         val context = getApplication<Application>().applicationContext
         val folderNameForSyncMessage = DocumentFile.fromTreeUri(context, folderUri)?.name ?: folderUri.toString()
 
@@ -135,41 +144,70 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         )
     }
 
-    // Helper function to send multiple files
-    private fun sendFiles(localFolderUri: Uri, filesToSend: List<String>, folderName: String) {
+    // Helper function to send multiple files sequentially
+    private fun sendFiles(localFolderUri: Uri, filesToSend: List<String>, folderName: String, expectedIncomingFiles: Int = 0) {
         viewModelScope.launch(Dispatchers.Main) {
             permissionRequestStatus.value = "Sending ${filesToSend.size} files to peer..."
         }
         
-        syncManager.startSyncSession(folderName, filesToSend.size, isInitiator = true)
+        // Start sync session with both send and receive counts
+        syncManager.startSyncSession(folderName, filesToSend.size, expectedIncomingFiles, isInitiator = true)
         
-        filesToSend.forEach { relativePath ->
-            // Check if this file is already being sent to avoid duplicates
-            if (!syncManager.isFilePendingSend(relativePath)) {
-                syncManager.sendFile(
-                    baseFolderUri = localFolderUri,
-                    relativePath = relativePath,
-                    syncFolderName = folderName,
-                    onProgress = { status ->
-                        permissionRequestStatus.value = status
-                    },
-                    onComplete = {
-                        // Check if all files in sync session are complete
-                        if (syncManager.updateSyncSessionProgress(folderName)) {
-                            sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = folderName))
-                            syncManager.clearSyncSession()
-                            _isRefreshing.value = false
-                            permissionRequestStatus.value = "All files sent successfully."
+        // Send files sequentially to avoid transfer conflicts
+        sendFilesSequentially(localFolderUri, filesToSend, folderName, 0)
+    }
+    
+    // Helper function to send files one by one
+    private fun sendFilesSequentially(localFolderUri: Uri, filesToSend: List<String>, folderName: String, index: Int) {
+        if (index >= filesToSend.size) {
+            Log.d("DevicesViewModel", "All files sent for folder: $folderName")
+            return
+        }
+        
+        val relativePath = filesToSend[index]
+        
+        // Check if this file is already being sent to avoid duplicates
+        if (!syncManager.isFilePendingSend(relativePath)) {
+            syncManager.sendFile(
+                baseFolderUri = localFolderUri,
+                relativePath = relativePath,
+                syncFolderName = folderName,
+                onProgress = { status ->
+                    permissionRequestStatus.value = status
+                },
+                onComplete = {
+                    // Update sent file progress
+                    syncManager.updateSyncSessionProgress(folderName)
+                    
+                    // Check if sync is complete
+                    if (syncManager.checkSyncCompletion()) {
+                        sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = folderName))
+                        syncManager.clearSyncSession()
+                        _isRefreshing.value = false
+                        permissionRequestStatus.value = "Sync complete - all files synchronized."
+                    } else {
+                        // Add a small delay before sending the next file to prevent receiver overload
+                        viewModelScope.launch {
+                            kotlinx.coroutines.delay(100) // 100ms delay between files
+                            sendFilesSequentially(localFolderUri, filesToSend, folderName, index + 1)
                         }
-                    },
-                    onError = { error ->
-                        permissionRequestStatus.value = error
-                        syncHistoryManager.addEntry(SyncHistoryEntry(folderName = folderName, status = "Error", details = error))
                     }
-                )
-            } else {
-                Log.d("DevicesViewModel", "Skipping duplicate send for file: $relativePath")
-            }
+                },
+                onError = { error ->
+                    permissionRequestStatus.value = error
+                    syncHistoryManager.addEntry(SyncHistoryEntry(folderName = folderName, status = "Error", details = error))
+                    
+                    // Continue with next file even if one fails
+                    viewModelScope.launch {
+                        kotlinx.coroutines.delay(100) // Small delay before retry
+                        sendFilesSequentially(localFolderUri, filesToSend, folderName, index + 1)
+                    }
+                }
+            )
+        } else {
+            Log.d("DevicesViewModel", "Skipping duplicate send for file: $relativePath")
+            // Skip to next file
+            sendFilesSequentially(localFolderUri, filesToSend, folderName, index + 1)
         }
     }
 
@@ -482,6 +520,13 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             when (message.type) {
                 MessageType.SYNC_REQUEST_METADATA -> {
                     Log.d("DevicesViewModel", "Received SYNC_REQUEST_METADATA for folder: ${message.folderName}")
+                    
+                    // Check if we're already processing a sync for this folder
+                    if (syncManager.isActive.value) {
+                        Log.w("DevicesViewModel", "Already processing sync, ignoring duplicate SYNC_REQUEST_METADATA")
+                        return@launch
+                    }
+                    
                     permissionRequestStatus.value = "Received sync request for '${message.folderName}'"
                     syncHistoryManager.addEntry(SyncHistoryEntry(folderName = message.folderName ?: "Unknown", status = "Initiated (Receiver)", details = "Received sync request for folder."))
                     
@@ -512,7 +557,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                             // RECEIVER SIDE: Send files immediately, but coordinate with protocol
                             Log.d("DevicesViewModel", "RECEIVER: Sending ${filesToSend.size} files after metadata exchange")
                             if (filesToSend.isNotEmpty()) {
-                                sendFiles(localFolderUri, filesToSend, folderName ?: "")
+                                // The receiver doesn't know how many files it will receive yet
+                                // That will be determined when FILES_REQUESTED_BY_PEER is received
+                                sendFiles(localFolderUri, filesToSend, folderName ?: "", expectedIncomingFiles = 0)
                             }
                         },
                         onSyncComplete = {
@@ -540,6 +587,16 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                             Log.d("DevicesViewModel", "INITIATOR: Sending ${filesToSend.size} files after metadata response")
                             sendFiles(localFolderUri, filesToSend, folderName ?: "")
                         },
+                        onSendFilesRequest = { filesToRequest ->
+                            Log.d("DevicesViewModel", "INITIATOR: Requesting ${filesToRequest.size} files from peer")
+                            // Add expected incoming files to sync session
+                            syncManager.addExpectedIncomingFiles(filesToRequest)
+                            sendMessage(SyncMessage(
+                                MessageType.FILES_REQUESTED_BY_PEER,
+                                folderName = folderName,
+                                requestedFilePaths = filesToRequest
+                            ))
+                        },
                         onStatusUpdate = { status -> permissionRequestStatus.value = status }
                     )
                 }
@@ -560,15 +617,21 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     permissionRequestStatus.value = "Peer requested ${requestedPaths?.size ?: 0} files from '${baseFolderName}'."
                     
                     if (requestedPaths.isNullOrEmpty()) {
-                        sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = message.folderName))
-                        _isRefreshing.value = false
-                        permissionRequestStatus.value = "Sync complete (no files to send)."
+                        // No files requested, check if sync is complete
+                        if (syncManager.checkSyncCompletion()) {
+                            sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = message.folderName))
+                            syncManager.clearSyncSession()
+                            _isRefreshing.value = false
+                            permissionRequestStatus.value = "Sync complete - all files synchronized."
+                        }
                     } else {
-                        sendFiles(senderBaseUri, requestedPaths, baseFolderName ?: "")
+                        // Just send the files, no need to track ACKs as received files
+                        sendFiles(senderBaseUri, requestedPaths, baseFolderName ?: "", expectedIncomingFiles = 0)
                     }
                 }
                 
                 MessageType.FILE_TRANSFER_START -> {
+                    Log.d("DevicesViewModel", "Received FILE_TRANSFER_START for ${message.fileTransferInfo?.relativePath ?: "unknown"} in folder ${message.folderName}")
                     fileTransferManager.handleFileTransferStart(
                         message = message,
                         destinationUri = _activeSyncDestinationUris.value[message.folderName] ?: defaultIncomingFolderUri,
@@ -593,6 +656,20 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                         onStatusUpdate = { status -> permissionRequestStatus.value = status },
                         onComplete = { originalPath ->
                             syncManager.clearFileRenameMapping(originalPath)
+                            
+                            // Update received file progress
+                            val folderName = message.folderName ?: ""
+                            if (syncManager.updateSyncSessionReceivedProgress(folderName)) {
+                                Log.d("DevicesViewModel", "File received, checking sync completion")
+                                if (syncManager.checkSyncCompletion()) {
+                                    Log.d("DevicesViewModel", "Sync completion detected after file receive")
+                                    sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = folderName))
+                                    syncManager.clearSyncSession()
+                                    _isRefreshing.value = false
+                                    permissionRequestStatus.value = "Sync complete - all files synchronized."
+                                }
+                            }
+                            
                             sendMessage(SyncMessage(
                                 MessageType.FILE_RECEIVED_ACK, 
                                 fileTransferInfo = message.fileTransferInfo
@@ -603,6 +680,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 
                 MessageType.FILE_RECEIVED_ACK -> {
                     Log.i("DevicesViewModel", "Peer ACKed file: ${message.fileTransferInfo?.relativePath}")
+                    // ACK is just a confirmation, no additional tracking needed
                 }
                 
                 MessageType.SYNC_COMPLETE -> {

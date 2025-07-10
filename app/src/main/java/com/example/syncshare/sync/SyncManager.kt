@@ -55,7 +55,9 @@ class SyncManager(
     data class SyncSession(
         val folderName: String,
         val totalFilesToSend: Int,
+        val totalFilesToReceive: Int = 0,
         val filesSentSuccessfully: Int = 0,
+        val filesReceivedSuccessfully: Int = 0,
         val isInitiator: Boolean = false  // Track if we initiated this sync
     )
     private var currentSyncSession: SyncSession? = null
@@ -252,7 +254,7 @@ class SyncManager(
                 Log.d("SyncManager", "Added $relativePath to pending sends (now ${pendingFileSends.size} pending)")
                 
                 // Send file chunks
-                val bufferSize = 4096
+                val bufferSize = 32768  // Increased from 4KB to 32KB for better efficiency
                 val buffer = ByteArray(bufferSize)
                 var totalBytesSent = 0L
                 
@@ -264,7 +266,7 @@ class SyncManager(
                             sendMessage(SyncMessage(MessageType.FILE_CHUNK, folderName = syncFolderName, fileChunkData = chunk))
                             totalBytesSent += bytesRead
                         }
-                        delay(5)
+                        delay(1)  // Reduced from 5ms to 1ms for better throughput
                     }
                 }
                 
@@ -316,11 +318,11 @@ class SyncManager(
     /**
      * Starts a new sync session
      */
-    fun startSyncSession(folderName: String, totalFiles: Int, isInitiator: Boolean = false) {
+    fun startSyncSession(folderName: String, totalFilesToSend: Int, totalFilesToReceive: Int = 0, isInitiator: Boolean = false) {
         // Clear any previous pending sends to start fresh
         pendingFileSends.clear()
-        currentSyncSession = SyncSession(folderName, totalFiles, 0, isInitiator)
-        Log.d("SyncManager", "Started sync session for $folderName with $totalFiles files (initiator: $isInitiator)")
+        currentSyncSession = SyncSession(folderName, totalFilesToSend, totalFilesToReceive, 0, 0, isInitiator)
+        Log.d("SyncManager", "Started sync session for $folderName with $totalFilesToSend files to send, $totalFilesToReceive files to receive (initiator: $isInitiator)")
     }
     
     /**
@@ -341,16 +343,58 @@ class SyncManager(
     }
     
     /**
-     * Updates the progress of the current sync session
+     * Updates the progress of the current sync session for sent files
      */
     fun updateSyncSessionProgress(folderName: String): Boolean {
         val session = currentSyncSession
         return if (session != null && session.folderName == folderName) {
             val updatedSession = session.copy(filesSentSuccessfully = session.filesSentSuccessfully + 1)
             currentSyncSession = updatedSession
-            updatedSession.filesSentSuccessfully >= updatedSession.totalFilesToSend
+            Log.d("SyncManager", "Updated sync session progress: ${updatedSession.filesSentSuccessfully}/${updatedSession.totalFilesToSend} files sent")
+            checkSyncCompletion()
         } else {
             false
+        }
+    }
+    
+    /**
+     * Updates the progress of the current sync session for received files
+     */
+    fun updateSyncSessionReceivedProgress(folderName: String): Boolean {
+        val session = currentSyncSession
+        return if (session != null && session.folderName == folderName) {
+            val updatedSession = session.copy(filesReceivedSuccessfully = session.filesReceivedSuccessfully + 1)
+            currentSyncSession = updatedSession
+            Log.d("SyncManager", "Updated sync session received progress: ${updatedSession.filesReceivedSuccessfully}/${updatedSession.totalFilesToReceive} files received")
+            checkSyncCompletion()
+        } else {
+            false
+        }
+    }
+    
+    /**
+     * Checks if the sync session is complete (both send and receive)
+     */
+    fun checkSyncCompletion(): Boolean {
+        val session = currentSyncSession ?: return false
+        val sendComplete = session.filesSentSuccessfully >= session.totalFilesToSend
+        val receiveComplete = session.filesReceivedSuccessfully >= session.totalFilesToReceive
+        val isComplete = sendComplete && receiveComplete
+        
+        Log.d("SyncManager", "Sync completion check: send=$sendComplete (${ session.filesSentSuccessfully}/${session.totalFilesToSend}), receive=$receiveComplete (${session.filesReceivedSuccessfully}/${session.totalFilesToReceive}), complete=$isComplete")
+        
+        return isComplete
+    }
+    
+    /**
+     * Adds expected incoming files to the current sync session
+     */
+    fun addExpectedIncomingFiles(filePaths: List<String>) {
+        val session = currentSyncSession
+        if (session != null) {
+            val updatedSession = session.copy(totalFilesToReceive = session.totalFilesToReceive + filePaths.size)
+            currentSyncSession = updatedSession
+            Log.d("SyncManager", "Added ${filePaths.size} expected incoming files. Total expected: ${updatedSession.totalFilesToReceive}")
         }
     }
     
@@ -465,6 +509,7 @@ class SyncManager(
         onSendFiles: (List<String>) -> Unit,
         onSyncComplete: () -> Unit
     ) {
+        _isActive.value = true
         scope.launch(Dispatchers.IO) {
             try {
                 val folderName = message.folderName ?: "Unknown"
@@ -532,6 +577,7 @@ class SyncManager(
         message: SyncMessage,
         localFolderUri: Uri,
         onSendFiles: (List<String>) -> Unit,
+        onSendFilesRequest: (List<String>) -> Unit,
         onStatusUpdate: (String) -> Unit
     ) {
         scope.launch(Dispatchers.IO) {
@@ -547,7 +593,7 @@ class SyncManager(
                 if (result.conflicts.isNotEmpty()) {
                     // Store callbacks for later when conflicts are resolved
                     pendingSyncCallbacks = PendingSyncCallbacks(
-                        onSendFilesRequest = { /* Not used in response */ },
+                        onSendFilesRequest = onSendFilesRequest,
                         onSendFiles = onSendFiles,
                         onSyncComplete = { onStatusUpdate("Sync complete - waiting for peer") },
                         onStatusUpdate = onStatusUpdate,
@@ -561,12 +607,18 @@ class SyncManager(
                         onStatusUpdate("Conflicts detected. Please resolve them to continue.")
                     }
                 } else {
-                    // No conflicts, proceed with sending files we need to send
+                    // No conflicts, proceed with two-way sync
                     withContext(Dispatchers.Main) {
+                        if (result.filesToRequest.isNotEmpty()) {
+                            onStatusUpdate("Requesting ${result.filesToRequest.size} files from peer...")
+                            onSendFilesRequest(result.filesToRequest)
+                        }
                         if (result.filesToSend.isNotEmpty()) {
+                            onStatusUpdate("Sending ${result.filesToSend.size} files to peer...")
                             onSendFiles(result.filesToSend)
-                        } else {
-                            onStatusUpdate("No files to send. Waiting for peer to complete sync.")
+                        }
+                        if (result.filesToRequest.isEmpty() && result.filesToSend.isEmpty()) {
+                            onStatusUpdate("Files are already synchronized.")
                         }
                     }
                 }

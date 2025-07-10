@@ -69,6 +69,25 @@ class FileTransferManager(
                 "Starting to receive file: ${fileInfo.relativePath} -> $finalPath"
             )
 
+            // Check if this file was already processed
+            if (processedFiles.contains(fileInfo.relativePath)) {
+                Log.w("FileTransferManager", "File ${fileInfo.relativePath} was already processed, ignoring duplicate start")
+                return
+            }
+
+            // Check if a transfer is already active
+            if (isTransferActive && currentReceivingFile != null) {
+                val currentFile = currentReceivingFile!!
+                if (currentFile.relativePath == finalPath) {
+                    Log.w("FileTransferManager", "Transfer for ${finalPath} is already active, ignoring duplicate")
+                    return
+                } else {
+                    Log.w("FileTransferManager", "Transfer for ${currentFile.relativePath} is active, cannot start ${finalPath}")
+                    onError("Another file transfer is already in progress: ${currentFile.relativePath}")
+                    return
+                }
+            }
+
             // Clear any previous state
             cleanup()
             
@@ -108,16 +127,46 @@ class FileTransferManager(
         }
 
         try {
-            if (currentFileOutputStream == null) {
-                currentFileOutputStream = createFileOutputStream(state)
-                if (currentFileOutputStream == null) {
-                    onError("Failed to create output stream for ${state.relativePath}")
-                    return false
+            // Check if we would exceed the expected file size
+            val potentialBytesReceived = state.bytesReceived + chunk.size
+            if (potentialBytesReceived > state.totalSize) {
+                Log.w(
+                    "FileTransferManager",
+                    "Chunk would exceed expected file size. Current: ${state.bytesReceived}, Chunk: ${chunk.size}, Expected: ${state.totalSize}"
+                )
+                
+                // Only write up to the expected size
+                val remainingBytes = (state.totalSize - state.bytesReceived).toInt()
+                if (remainingBytes <= 0) {
+                    Log.w("FileTransferManager", "File ${state.relativePath} already complete, ignoring chunk")
+                    return true
                 }
-            }
+                
+                Log.i("FileTransferManager", "Writing only $remainingBytes bytes to prevent overrun")
+                val truncatedChunk = chunk.sliceArray(0 until remainingBytes)
+                
+                if (currentFileOutputStream == null) {
+                    currentFileOutputStream = createFileOutputStream(state)
+                    if (currentFileOutputStream == null) {
+                        onError("Failed to create output stream for ${state.relativePath}")
+                        return false
+                    }
+                }
+                
+                currentFileOutputStream?.write(truncatedChunk)
+                state.bytesReceived += truncatedChunk.size
+            } else {
+                if (currentFileOutputStream == null) {
+                    currentFileOutputStream = createFileOutputStream(state)
+                    if (currentFileOutputStream == null) {
+                        onError("Failed to create output stream for ${state.relativePath}")
+                        return false
+                    }
+                }
 
-            currentFileOutputStream?.write(chunk)
-            state.bytesReceived += chunk.size
+                currentFileOutputStream?.write(chunk)
+                state.bytesReceived += chunk.size
+            }
 
             Log.d(
                 "FileTransferManager",
@@ -161,6 +210,26 @@ class FileTransferManager(
             
             currentFileOutputStream?.close()
             currentFileOutputStream = null
+
+            // Validate file size
+            if (state.bytesReceived != state.totalSize) {
+                Log.w(
+                    "FileTransferManager",
+                    "File size mismatch for ${state.relativePath}: received ${state.bytesReceived} bytes, expected ${state.totalSize} bytes"
+                )
+                
+                if (state.bytesReceived > state.totalSize) {
+                    Log.e("FileTransferManager", "File ${state.relativePath} received MORE bytes than expected - possible corruption")
+                    onError("File ${state.relativePath} corrupted: received ${state.bytesReceived} bytes, expected ${state.totalSize}")
+                    cleanup()
+                    return null
+                } else {
+                    Log.e("FileTransferManager", "File ${state.relativePath} incomplete: received ${state.bytesReceived} bytes, expected ${state.totalSize}")
+                    onError("File ${state.relativePath} incomplete: received ${state.bytesReceived} bytes, expected ${state.totalSize}")
+                    cleanup()
+                    return null
+                }
+            }
 
             val displayPath = if (state.originalPath != state.relativePath) {
                 "${state.relativePath} (renamed from ${state.originalPath})"
@@ -300,6 +369,8 @@ class FileTransferManager(
                 return
             }
 
+            Log.d("FileTransferManager", "handleFileTransferStart - File: ${fileTransferInfo.relativePath}, Size: ${fileTransferInfo.fileSize}, Folder: $folderName")
+
             val finalDestinationUri = destinationUri ?: run {
                 onError("No destination URI for folder: $folderName")
                 return
@@ -308,6 +379,8 @@ class FileTransferManager(
             // Check for rename mapping
             val finalPath =
                 fileRenameMap(fileTransferInfo.relativePath) ?: fileTransferInfo.relativePath
+
+            Log.d("FileTransferManager", "Final path after rename mapping: $finalPath")
 
             startFileReceive(
                 fileInfo = fileTransferInfo,
