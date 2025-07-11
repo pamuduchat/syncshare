@@ -209,6 +209,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         // Set up two-way sync coordinator
         setupTwoWaySyncCoordinator()
         
+        // Initialize Bluetooth server for incoming connections
+        initializeBluetoothServer()
+        
         // Collect from WifiDirectManager state flows
         viewModelScope.launch {
             wifiDirectManager.discoveredPeers.collect { peers ->
@@ -246,6 +249,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             bluetoothConnectionManager.statusMessage.collect { message ->
                 if (message.contains("Bluetooth") || message.contains("BT")) {
+                    Log.d("DevicesViewModel", "Bluetooth status update: $message")
                     permissionRequestStatus.value = message
                 }
             }
@@ -267,6 +271,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             bluetoothConnectionManager.connectedSocket.collect { socket ->
                 if (socket != null) {
+                    Log.d("DevicesViewModel", "Bluetooth socket connected, setting up communication")
                     setupCommunicationStreams(socket, CommunicationTechnology.BLUETOOTH)
                     syncHistoryManager.addEntry(SyncHistoryEntry(
                         folderName = "N/A", 
@@ -276,7 +281,9 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                     ))
                     updateDisplayableDeviceList()
                 } else {
+                    Log.d("DevicesViewModel", "Bluetooth socket disconnected")
                     if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH) {
+                        Log.d("DevicesViewModel", "Cleaning up Bluetooth communication manager")
                         connectionManager.cleanup()
                         currentCommunicationTechnology = null
                     }
@@ -325,6 +332,24 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             }
         }
         
+        // Monitor Bluetooth enabled state to restart server when needed
+        viewModelScope.launch {
+            bluetoothConnectionManager.isBluetoothEnabled.collect { enabled ->
+                Log.d("DevicesViewModel", "Bluetooth enabled state changed: $enabled")
+                if (enabled) {
+                    // Restart server when Bluetooth is enabled
+                    initializeBluetoothServer()
+                } else {
+                    // Reset sync state if Bluetooth is disabled during sync
+                    if (currentCommunicationTechnology == CommunicationTechnology.BLUETOOTH && _isRefreshing.value) {
+                        Log.w("DevicesViewModel", "Bluetooth disabled during sync, resetting sync state")
+                        resetSyncState()
+                        permissionRequestStatus.value = "Sync interrupted: Bluetooth disabled"
+                    }
+                }
+            }
+        }
+        
         Log.d("DevicesViewModel", "DevicesViewModel - INIT BLOCK - END")
     }
 
@@ -356,7 +381,11 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     fun getDiagnosticsInfo(): String = wifiDirectManager.checkWifiDirectStatus()
 
     // --- Bluetooth Methods - Delegated to BluetoothConnectionManager ---
-    fun startBluetoothDiscovery() = bluetoothConnectionManager.startDiscovery()
+    fun startBluetoothDiscovery() {
+        bluetoothConnectionManager.startDiscovery()
+        // Also add paired devices to the list for better connectivity options
+        bluetoothConnectionManager.addPairedDevices()
+    }
     
     fun stopBluetoothDiscovery() = bluetoothConnectionManager.stopDiscovery()
 
@@ -369,6 +398,12 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun stopBluetoothServer() = bluetoothConnectionManager.stopServer()
+    
+    // Initialize Bluetooth server for incoming connections
+    private fun initializeBluetoothServer() {
+        Log.d("DevicesViewModel", "Initializing Bluetooth server for incoming connections")
+        bluetoothConnectionManager.prepareService()
+    }
 
     // --- Unified List & Helpers ---
     @SuppressLint("MissingPermission")

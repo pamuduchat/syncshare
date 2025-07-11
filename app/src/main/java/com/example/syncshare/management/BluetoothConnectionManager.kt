@@ -348,7 +348,7 @@ class BluetoothConnectionManager(
             } catch (e: IOException) {
                 Log.e("BluetoothConnectionManager", "Bluetooth connection failed for $deviceNameForLog: ${e.message}", e)
                 withContext(Dispatchers.Main) {
-                    _statusMessage.value = "BT Connection Failed: ${e.localizedMessage}"
+                    _statusMessage.value = "BT Connection Failed: ${e.localizedMessage ?: "Unknown error"}"
                     _connectionStatus.value = "Connection Failed"
                     _connectedDeviceAddress.value = null
                 }
@@ -356,6 +356,15 @@ class BluetoothConnectionManager(
                     socket?.close()
                 } catch (closeException: IOException) {
                     Log.e("BluetoothConnectionManager", "Could not close client socket post-failure", closeException)
+                }
+                
+                // Restart server to accept new connections
+                scope.launch {
+                    delay(1000) // Brief delay before restart
+                    if (_isBluetoothEnabled.value) {
+                        Log.d("BluetoothConnectionManager", "Restarting server after connection failure")
+                        startServer()
+                    }
                 }
             } catch (se: SecurityException) {
                 Log.e("BluetoothConnectionManager", "SecurityException during BT connection: ${se.message}", se)
@@ -409,63 +418,98 @@ class BluetoothConnectionManager(
 
         bluetoothServerJob = scope.launch(Dispatchers.IO) {
             Log.i("BluetoothConnectionManager", "Starting Bluetooth server thread...")
-            _statusMessage.value = "Bluetooth server starting..."
-            var tempSocket: BluetoothSocket?
+            withContext(Dispatchers.Main) {
+                _statusMessage.value = "Bluetooth server starting..."
+            }
             
-            try {
-                btServerSocket = bluetoothAdapter?.listenUsingRfcommWithServiceRecord(AppConstants.BLUETOOTH_SERVICE_NAME, AppConstants.BLUETOOTH_SERVICE_UUID)
-                Log.d("BluetoothConnectionManager", "BT ServerSocket listening with UUID: ${AppConstants.BLUETOOTH_SERVICE_UUID}")
-                
-                while (isActive) {
-                    try {
-                        Log.d("BluetoothConnectionManager", "BT server calling btServerSocket.accept()...")
-                        tempSocket = btServerSocket?.accept()
-                    } catch (e: IOException) {
-                        if (isActive) {
-                            Log.e("BluetoothConnectionManager", "BT server socket accept() failed or closed.", e)
-                        } else {
-                            Log.d("BluetoothConnectionManager", "BT server socket accept() interrupted by cancellation.")
-                        }
-                        break
+            var tempSocket: BluetoothSocket?
+            var retryCount = 0
+            val maxRetries = 3
+            
+            while (isActive && retryCount < maxRetries) {
+                try {
+                    btServerSocket = bluetoothAdapter?.listenUsingRfcommWithServiceRecord(AppConstants.BLUETOOTH_SERVICE_NAME, AppConstants.BLUETOOTH_SERVICE_UUID)
+                    Log.d("BluetoothConnectionManager", "BT ServerSocket listening with UUID: ${AppConstants.BLUETOOTH_SERVICE_UUID}")
+                    
+                    withContext(Dispatchers.Main) {
+                        _statusMessage.value = "Bluetooth server ready for connections."
                     }
                     
-                    tempSocket?.let { socket ->
-                        val remoteDeviceName = try {
-                            socket.remoteDevice.name
-                        } catch(e: SecurityException) {
-                            null
-                        } ?: socket.remoteDevice.address
+                    while (isActive) {
+                        try {
+                            Log.d("BluetoothConnectionManager", "BT server calling btServerSocket.accept()...")
+                            tempSocket = btServerSocket?.accept()
+                        } catch (e: IOException) {
+                            if (isActive) {
+                                Log.e("BluetoothConnectionManager", "BT server socket accept() failed or closed.", e)
+                                withContext(Dispatchers.Main) {
+                                    _statusMessage.value = "BT server connection error: ${e.message}"
+                                }
+                            } else {
+                                Log.d("BluetoothConnectionManager", "BT server socket accept() interrupted by cancellation.")
+                            }
+                            break
+                        }
                         
-                        Log.i("BluetoothConnectionManager", "BT connection accepted from: $remoteDeviceName")
-                        handleAcceptedConnection(socket)
+                        tempSocket?.let { socket ->
+                            val remoteDeviceName = try {
+                                socket.remoteDevice.name
+                            } catch(e: SecurityException) {
+                                null
+                            } ?: socket.remoteDevice.address
+                            
+                            Log.i("BluetoothConnectionManager", "BT connection accepted from: $remoteDeviceName")
+                            handleAcceptedConnection(socket)
+                        }
                     }
-                }
-            } catch (e: IOException) {
-                Log.e("BluetoothConnectionManager", "BT server listenUsingRfcomm failed", e)
-                withContext(Dispatchers.Main) {
-                    _statusMessage.value = "BT Server Error: ${e.message}"
-                }
-            } catch (se: SecurityException) {
-                Log.e("BluetoothConnectionManager", "SecEx starting BT server: ${se.message}", se)
-                withContext(Dispatchers.Main) {
-                    _statusMessage.value = "BT Server Permission Error"
-                }
-            } finally {
-                Log.d("BluetoothConnectionManager", "Bluetooth server thread ending.")
-                try {
-                    btServerSocket?.close()
+                    break // Success - exit retry loop
+                    
                 } catch (e: IOException) {
-                    Log.e("BluetoothConnectionManager", "Could not close BT server socket on exit: ${e.message}")
+                    retryCount++
+                    Log.e("BluetoothConnectionManager", "BT server listenUsingRfcomm failed (attempt $retryCount/$maxRetries)", e)
+                    
+                    if (retryCount < maxRetries && isActive) {
+                        Log.d("BluetoothConnectionManager", "Retrying BT server start in 2 seconds...")
+                        delay(2000)
+                    } else {
+                        withContext(Dispatchers.Main) {
+                            _statusMessage.value = "BT Server failed after $retryCount attempts: ${e.message}"
+                        }
+                    }
+                } catch (se: SecurityException) {
+                    Log.e("BluetoothConnectionManager", "SecEx starting BT server: ${se.message}", se)
+                    withContext(Dispatchers.Main) {
+                        _statusMessage.value = "BT Server Permission Error"
+                    }
+                    break
                 }
-                btServerSocket = null
             }
+            
+            Log.d("BluetoothConnectionManager", "Bluetooth server thread ending.")
+            try {
+                btServerSocket?.close()
+            } catch (e: IOException) {
+                Log.e("BluetoothConnectionManager", "Could not close BT server socket on exit: ${e.message}")
+            }
+            btServerSocket = null
         }
     }
 
     fun stopServer() {
         Log.i("BluetoothConnectionManager", "Stopping Bluetooth server...")
+        
+        // First close the server socket to interrupt accept() calls
+        try {
+            btServerSocket?.close()
+        } catch (e: IOException) {
+            Log.e("BluetoothConnectionManager", "Error closing BT server socket: ${e.message}")
+        }
+        btServerSocket = null
+        
+        // Then cancel the job
         bluetoothServerJob?.cancel()
         bluetoothServerJob = null
+        
         _statusMessage.value = "Bluetooth server stopped."
     }
 
@@ -527,6 +571,47 @@ class BluetoothConnectionManager(
             stopDiscovery()
             stopServer()
             disconnect()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun addPairedDevices() {
+        if (bluetoothAdapter == null || !_isBluetoothEnabled.value) {
+            Log.w("BluetoothConnectionManager", "Cannot get paired devices: BT not ready")
+            return
+        }
+        
+        val connectPerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Manifest.permission.BLUETOOTH_CONNECT else Manifest.permission.BLUETOOTH
+        if (ActivityCompat.checkSelfPermission(context, connectPerm) != PackageManager.PERMISSION_GRANTED) {
+            Log.w("BluetoothConnectionManager", "Cannot get paired devices: Missing $connectPerm permission")
+            return
+        }
+        
+        try {
+            val pairedDevices = bluetoothAdapter?.bondedDevices ?: emptySet()
+            Log.d("BluetoothConnectionManager", "Found ${pairedDevices.size} paired devices")
+            
+            val currentDevices = _discoveredDevices.value.toMutableList()
+            var newDevicesAdded = 0
+            
+            pairedDevices.forEach { device ->
+                if (!currentDevices.any { it.address == device.address }) {
+                    Log.d("BluetoothConnectionManager", "Adding paired device: ${device.name ?: "Unknown"} (${device.address})")
+                    currentDevices.add(device)
+                    newDevicesAdded++
+                }
+            }
+            
+            if (newDevicesAdded > 0) {
+                _discoveredDevices.value = currentDevices
+                _statusMessage.value = "Added $newDevicesAdded paired device(s) to list."
+            } else {
+                _statusMessage.value = "All paired devices already in list."
+            }
+            
+        } catch (e: SecurityException) {
+            Log.e("BluetoothConnectionManager", "SecurityException getting paired devices: ${e.message}")
+            _statusMessage.value = "Permission error getting paired devices"
         }
     }
 
