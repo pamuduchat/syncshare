@@ -8,6 +8,7 @@ enum class MessageType : Serializable {
     FILES_REQUESTED_BY_PEER, // Server responds with list of files it needs
     FILE_TRANSFER_START,     // Client indicates start of a file transfer
     FILE_CHUNK,              // A chunk of file data
+    FILE_CHUNK_ACK,          // Receiver acknowledges chunk received and ready for next
     FILE_TRANSFER_END,       // Client indicates end of a file transfer
     FILE_RECEIVED_ACK,       // Server acknowledges a file
     SYNC_COMPLETE,           // Client indicates all requested files sent

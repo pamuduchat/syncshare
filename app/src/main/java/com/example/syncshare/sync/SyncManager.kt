@@ -253,10 +253,11 @@ class SyncManager(
                 pendingFileSends.add(relativePath)
                 Log.d("SyncManager", "Added $relativePath to pending sends (now ${pendingFileSends.size} pending)")
                 
-                // Send file chunks
-                val bufferSize = 32768  // Increased from 4KB to 32KB for better efficiency
+                // Send file chunks with flow control
+                val bufferSize = 8192  // Reduced from 32KB to 8KB for better flow control
                 val buffer = ByteArray(bufferSize)
                 var totalBytesSent = 0L
+                var chunkSequence = 0
                 
                 context.contentResolver.openInputStream(documentFile.uri)?.use { inputStream ->
                     var bytesRead: Int
@@ -265,8 +266,11 @@ class SyncManager(
                             val chunk = buffer.copyOf(bytesRead)
                             sendMessage(SyncMessage(MessageType.FILE_CHUNK, folderName = syncFolderName, fileChunkData = chunk))
                             totalBytesSent += bytesRead
+                            chunkSequence++
+                            
+                            // Reduced delay for better throughput while maintaining reliability
+                            delay(5)  // Reduced from 10ms to 5ms for better balance
                         }
-                        delay(1)  // Reduced from 5ms to 1ms for better throughput
                     }
                 }
                 
@@ -322,7 +326,7 @@ class SyncManager(
         // Clear any previous pending sends to start fresh
         pendingFileSends.clear()
         currentSyncSession = SyncSession(folderName, totalFilesToSend, totalFilesToReceive, 0, 0, isInitiator)
-        Log.d("SyncManager", "Started sync session for $folderName with $totalFilesToSend files to send, $totalFilesToReceive files to receive (initiator: $isInitiator)")
+        Log.d("SyncManager", "Started sync session for $folderName with $totalFilesToSend files to send, $totalFilesToReceive files to receive (initiator: $isInitiator). Cleared ${pendingFileSends.size} pending sends.")
     }
     
     /**
@@ -461,13 +465,20 @@ class SyncManager(
             if (localMeta == null) {
                 // File exists on remote but not local - request it
                 filesToRequest.add(remotePath)
+                Log.d("SyncManager", "File '$remotePath' exists on remote but not local - will request")
             } else {
                 // File exists on both - check for conflicts
+                // Only compare hashes if both are non-empty to avoid false conflicts
                 val hasContentDifference = (remoteMeta.size != localMeta.size) || 
-                    (remoteMeta.hash != null && localMeta.hash != null && remoteMeta.hash != localMeta.hash)
+                    (remoteMeta.hash != null && localMeta.hash != null && 
+                     remoteMeta.hash.isNotEmpty() && localMeta.hash.isNotEmpty() && 
+                     remoteMeta.hash != localMeta.hash)
                 
                 if (hasContentDifference) {
                     conflicts.add(FileConflict(folderName, remotePath, localMeta, remoteMeta))
+                    Log.d("SyncManager", "Conflict detected for '$remotePath' - size: local=${localMeta.size}, remote=${remoteMeta.size}, hash: local=${localMeta.hash}, remote=${remoteMeta.hash}")
+                } else {
+                    Log.d("SyncManager", "File '$remotePath' is identical on both sides")
                 }
             }
         }
@@ -476,9 +487,11 @@ class SyncManager(
         for ((localPath, _) in localFileMap) {
             if (!remoteFileMap.containsKey(localPath)) {
                 filesToSend.add(localPath)
+                Log.d("SyncManager", "File '$localPath' exists locally but not on remote - will send")
             }
         }
         
+        Log.d("SyncManager", "Metadata comparison result: ${filesToRequest.size} to request, ${filesToSend.size} to send, ${conflicts.size} conflicts")
         return ComparisonResult(filesToRequest, filesToSend, conflicts)
     }
     

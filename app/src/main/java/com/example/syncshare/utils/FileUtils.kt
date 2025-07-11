@@ -16,9 +16,11 @@ fun computeFileHash(context: Context, file: DocumentFile): String {
                 digest.update(buffer, 0, bytesRead)
             }
         }
-        return digest.digest().joinToString("") { "%02x".format(it) }
+        val hash = digest.digest().joinToString("") { "%02x".format(it) }
+        Log.d("FileUtils", "Computed hash for '${file.name}': $hash")
+        return hash
     } catch (e: Exception) {
-        Log.e("FileUtils", "Error computing hash for file: ${file.uri}", e) // Log source
+        Log.e("FileUtils", "Error computing hash for file: ${file.name} (${file.uri})", e)
         return ""
     }
 }

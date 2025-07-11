@@ -177,6 +177,11 @@ class ConnectionManager(private val scope: CoroutineScope) {
                     MessageType.FILES_REQUESTED_BY_PEER -> onFileRequest?.invoke(message)
                     MessageType.FILE_TRANSFER_START -> onFileTransferStart?.invoke(message)
                     MessageType.FILE_CHUNK -> onFileChunk?.invoke(message)
+                    MessageType.FILE_CHUNK_ACK -> {
+                        // Chunk acknowledgment - handled by general message handler
+                        // No specific routing needed as this is handled in DevicesViewModel
+                        Log.d("ConnectionManager", "FILE_CHUNK_ACK received and forwarded to general handler")
+                    }
                     MessageType.FILE_TRANSFER_END -> onFileTransferEnd?.invoke(message)
                     MessageType.FILE_RECEIVED_ACK -> onFileAck?.invoke(message)
                     MessageType.SYNC_COMPLETE -> onSyncComplete?.invoke(message)

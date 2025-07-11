@@ -132,17 +132,17 @@ class FileTransferManager(
             if (potentialBytesReceived > state.totalSize) {
                 Log.w(
                     "FileTransferManager",
-                    "Chunk would exceed expected file size. Current: ${state.bytesReceived}, Chunk: ${chunk.size}, Expected: ${state.totalSize}"
+                    "Chunk would exceed expected file size for ${state.relativePath}. Current: ${state.bytesReceived}, Chunk: ${chunk.size}, Expected: ${state.totalSize}"
                 )
                 
                 // Only write up to the expected size
                 val remainingBytes = (state.totalSize - state.bytesReceived).toInt()
                 if (remainingBytes <= 0) {
-                    Log.w("FileTransferManager", "File ${state.relativePath} already complete, ignoring chunk")
+                    Log.w("FileTransferManager", "File ${state.relativePath} already complete (${state.bytesReceived}/${state.totalSize} bytes), ignoring chunk of ${chunk.size} bytes")
                     return true
                 }
                 
-                Log.i("FileTransferManager", "Writing only $remainingBytes bytes to prevent overrun")
+                Log.i("FileTransferManager", "Truncating chunk from ${chunk.size} to $remainingBytes bytes to prevent overrun for ${state.relativePath}")
                 val truncatedChunk = chunk.sliceArray(0 until remainingBytes)
                 
                 if (currentFileOutputStream == null) {
@@ -155,6 +155,11 @@ class FileTransferManager(
                 
                 currentFileOutputStream?.write(truncatedChunk)
                 state.bytesReceived += truncatedChunk.size
+                
+                // Log completion when we reach the expected size
+                if (state.bytesReceived == state.totalSize) {
+                    Log.i("FileTransferManager", "File ${state.relativePath} reached expected size (${state.totalSize} bytes) with this truncated chunk")
+                }
             } else {
                 if (currentFileOutputStream == null) {
                     currentFileOutputStream = createFileOutputStream(state)
@@ -166,6 +171,16 @@ class FileTransferManager(
 
                 currentFileOutputStream?.write(chunk)
                 state.bytesReceived += chunk.size
+                
+                // Flush periodically for data integrity (every 64KB)
+                if (state.bytesReceived % 65536 == 0L) {
+                    try {
+                        currentFileOutputStream?.flush()
+                        Log.v("FileTransferManager", "Periodic flush at ${state.bytesReceived} bytes for ${state.relativePath}")
+                    } catch (e: IOException) {
+                        Log.w("FileTransferManager", "Warning: Failed to flush output stream during transfer", e)
+                    }
+                }
             }
 
             Log.d(
@@ -208,8 +223,17 @@ class FileTransferManager(
         return try {
             Log.d("FileTransferManager", "Finalizing file: ${state.relativePath} (${state.bytesReceived}/${state.totalSize} bytes)")
             
+            // Ensure all data is written to disk before closing
+            try {
+                currentFileOutputStream?.flush()
+                Log.d("FileTransferManager", "File output stream flushed for ${state.relativePath}")
+            } catch (e: IOException) {
+                Log.w("FileTransferManager", "Warning: Failed to flush output stream for ${state.relativePath}", e)
+            }
+            
             currentFileOutputStream?.close()
             currentFileOutputStream = null
+            Log.d("FileTransferManager", "File output stream closed for ${state.relativePath}")
 
             // Validate file size
             if (state.bytesReceived != state.totalSize) {
@@ -351,6 +375,11 @@ class FileTransferManager(
     fun getCurrentTransferState(): FileTransferState? = currentReceivingFile
 
     /**
+     * Check if there's an active file transfer
+     */
+    fun hasActiveTransfer(): Boolean = isTransferActive && currentReceivingFile != null
+
+    /**
      * Handles FILE_TRANSFER_START message
      */
     fun handleFileTransferStart(
@@ -403,15 +432,9 @@ class FileTransferManager(
     fun handleFileChunk(chunkData: ByteArray) {
         val currentState = currentReceivingFile
         
-        // Check if transfer is still active
-        if (!isTransferActive) {
-            Log.w("FileTransferManager", "Ignoring chunk - transfer is no longer active")
-            return
-        }
-        
-        // Check if this file was already processed
+        // First check if this file was already processed (more specific)
         if (currentState != null && processedFiles.contains(currentState.originalPath)) {
-            Log.w("FileTransferManager", "Ignoring chunk for already processed file: ${currentState.originalPath}")
+            Log.w("FileTransferManager", "File ${currentState.originalPath} already complete, ignoring chunk")
             return
         }
         
@@ -421,12 +444,18 @@ class FileTransferManager(
             return
         }
         
+        // Check if transfer is still active
+        if (!isTransferActive) {
+            Log.w("FileTransferManager", "Ignoring chunk - transfer is no longer active for ${currentState.originalPath}")
+            return
+        }
+        
         val success = appendFileChunk(chunkData) { error ->
             Log.e("FileTransferManager", "Error handling chunk: $error")
         }
 
         if (!success) {
-            Log.e("FileTransferManager", "Failed to append file chunk")
+            Log.e("FileTransferManager", "Failed to append file chunk for ${currentState.originalPath}")
         }
     }
 
@@ -489,5 +518,33 @@ class FileTransferManager(
     fun clearProcessedFiles() {
         processedFiles.clear()
         Log.d("FileTransferManager", "Cleared processed files tracking")
+    }
+    
+    /**
+     * Force cleanup of stuck transfers (useful for recovery)
+     */
+    fun forceCleanup() {
+        Log.w("FileTransferManager", "Force cleanup called - clearing stuck transfer state")
+        cleanup()
+        processedFiles.clear()
+        Log.d("FileTransferManager", "Force cleanup completed")
+    }
+    
+    /**
+     * Get current transfer status for debugging
+     */
+    fun getTransferDebugInfo(): String {
+        val state = currentReceivingFile
+        return buildString {
+            appendLine("Transfer Debug Info:")
+            appendLine("- isTransferActive: $isTransferActive")
+            appendLine("- currentReceivingFile: ${state?.relativePath ?: "NULL"}")
+            if (state != null) {
+                appendLine("- bytesReceived: ${state.bytesReceived}/${state.totalSize}")
+                appendLine("- originalPath: ${state.originalPath}")
+            }
+            appendLine("- processedFiles count: ${processedFiles.size}")
+            appendLine("- processedFiles: $processedFiles")
+        }
     }
 }

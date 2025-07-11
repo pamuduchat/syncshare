@@ -130,6 +130,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
         _isRefreshing.value = true
         
+        Log.d("DevicesViewModel", "Initiating sync request for folder: $folderNameForSyncMessage")
+        
         syncManager.initiateSyncRequest(
             folderUri = folderUri,
             folderName = folderNameForSyncMessage,
@@ -140,6 +142,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
             onError = { error ->
                 permissionRequestStatus.value = error
                 _isRefreshing.value = false
+                Log.e("DevicesViewModel", "Error initiating sync: $error")
             }
         )
     }
@@ -167,7 +170,11 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         val relativePath = filesToSend[index]
         
         // Check if this file is already being sent to avoid duplicates
-        if (!syncManager.isFilePendingSend(relativePath)) {
+        val isAlreadyPending = syncManager.isFilePendingSend(relativePath)
+        Log.d("DevicesViewModel", "Checking file '$relativePath' for duplicate send: isPending=$isAlreadyPending")
+        
+        if (!isAlreadyPending) {
+            Log.d("DevicesViewModel", "Sending file: $relativePath ($index/${filesToSend.size})")
             syncManager.sendFile(
                 baseFolderUri = localFolderUri,
                 relativePath = relativePath,
@@ -205,7 +212,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 }
             )
         } else {
-            Log.d("DevicesViewModel", "Skipping duplicate send for file: $relativePath")
+            Log.d("DevicesViewModel", "Skipping duplicate send for file: $relativePath (already pending)")
             // Skip to next file
             sendFilesSequentially(localFolderUri, filesToSend, folderName, index + 1)
         }
@@ -632,6 +639,17 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 
                 MessageType.FILE_TRANSFER_START -> {
                     Log.d("DevicesViewModel", "Received FILE_TRANSFER_START for ${message.fileTransferInfo?.relativePath ?: "unknown"} in folder ${message.folderName}")
+                    
+                    // Check if this is a duplicate transfer start
+                    val currentTransfer = fileTransferManager.getCurrentTransferState()
+                    if (currentTransfer != null && fileTransferManager.hasActiveTransfer()) {
+                        val incomingPath = message.fileTransferInfo?.relativePath
+                        if (currentTransfer.originalPath == incomingPath || currentTransfer.relativePath == incomingPath) {
+                            Log.w("DevicesViewModel", "Ignoring duplicate FILE_TRANSFER_START for ${incomingPath}")
+                            return@launch
+                        }
+                    }
+                    
                     fileTransferManager.handleFileTransferStart(
                         message = message,
                         destinationUri = _activeSyncDestinationUris.value[message.folderName] ?: defaultIncomingFolderUri,
@@ -646,7 +664,24 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 
                 MessageType.FILE_CHUNK -> {
                     message.fileChunkData?.let { 
-                        fileTransferManager.handleFileChunk(it)
+                        if (fileTransferManager.hasActiveTransfer()) {
+                            fileTransferManager.handleFileChunk(it)
+                            // Send acknowledgment for flow control
+                            sendMessage(SyncMessage(MessageType.FILE_CHUNK_ACK, folderName = message.folderName))
+                        } else {
+                            Log.d("DevicesViewModel", "Ignoring FILE_CHUNK message - no active file transfer")
+                        }
+                    }
+                }
+                
+                MessageType.FILE_CHUNK_ACK -> {
+                    // Handle chunk acknowledgment for flow control
+                    // Only process if there's an active transfer
+                    if (fileTransferManager.hasActiveTransfer()) {
+                        Log.d("DevicesViewModel", "Received chunk ACK for folder: ${message.folderName}")
+                        // This can be used to implement proper backpressure in the future
+                    } else {
+                        Log.d("DevicesViewModel", "Ignoring FILE_CHUNK_ACK message - no active file transfer")
                     }
                 }
                 
