@@ -569,6 +569,9 @@ class SyncManager(
                             onSendFiles(result.filesToSend)
                         }
                         if (result.filesToRequest.isEmpty() && result.filesToSend.isEmpty()) {
+                            // If no files need to be transferred, the sync is complete
+                            // Create a session with 0 files to send/receive for proper completion tracking
+                            startSyncSession(folderName, 0, 0, isInitiator = false)
                             onSyncComplete()
                         }
                     }
@@ -621,6 +624,18 @@ class SyncManager(
                     }
                 } else {
                     // No conflicts, proceed with two-way sync
+                    // Initialize sync session for initiator
+                    val totalFilesToSend = result.filesToSend.size
+                    val totalFilesToReceive = result.filesToRequest.size
+                    
+                    // Only start a new session if we don't have one already
+                    if (currentSyncSession == null) {
+                        startSyncSession(folderName, totalFilesToSend, totalFilesToReceive, isInitiator = true)
+                    } else {
+                        // Update existing session with receive count
+                        addExpectedIncomingFiles(result.filesToRequest)
+                    }
+                    
                     withContext(Dispatchers.Main) {
                         if (result.filesToRequest.isNotEmpty()) {
                             onStatusUpdate("Requesting ${result.filesToRequest.size} files from peer...")
@@ -632,6 +647,9 @@ class SyncManager(
                         }
                         if (result.filesToRequest.isEmpty() && result.filesToSend.isEmpty()) {
                             onStatusUpdate("Files are already synchronized.")
+                            // If no files need to be transferred, the sync is complete
+                            // Create a session with 0 files to send/receive and mark it complete
+                            startSyncSession(folderName, 0, 0, isInitiator = true)
                         }
                     }
                 }
@@ -763,5 +781,19 @@ class SyncManager(
         currentSyncSession = null
         conflictResolutions.clear()
         pendingSyncCallbacks = null
+    }
+    
+    /**
+     * Handles sync completion logic
+     */
+    fun handleSyncComplete() {
+        Log.d("SyncManager", "Handling sync completion")
+        val currentSession = getCurrentSyncSession()
+        if (currentSession != null) {
+            if (checkSyncCompletion()) {
+                Log.d("SyncManager", "Sync is complete for folder: ${currentSession.folderName}")
+                clearSyncSession()
+            }
+        }
     }
 }
