@@ -26,7 +26,6 @@ data class SyncMessage(
     }
     override fun hashCode(): Int {
         var result = type.hashCode()
-        // ... include other fields ...
         result = 31 * result + (fileChunkData?.contentHashCode() ?: 0)
         return result
     }

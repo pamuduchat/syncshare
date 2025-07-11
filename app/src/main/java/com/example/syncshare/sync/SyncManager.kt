@@ -254,7 +254,7 @@ class SyncManager(
                 Log.d("SyncManager", "Added $relativePath to pending sends (now ${pendingFileSends.size} pending)")
                 
                 // Send file chunks with flow control
-                val bufferSize = 8192  // Reduced from 32KB to 8KB for better flow control
+                val bufferSize = 8192  // 8KB for better flow control
                 val buffer = ByteArray(bufferSize)
                 var totalBytesSent = 0L
                 var chunkSequence = 0
@@ -267,9 +267,8 @@ class SyncManager(
                             sendMessage(SyncMessage(MessageType.FILE_CHUNK, folderName = syncFolderName, fileChunkData = chunk))
                             totalBytesSent += bytesRead
                             chunkSequence++
-                            
-                            // Reduced delay for better throughput while maintaining reliability
-                            delay(5)  // Reduced from 10ms to 5ms for better balance
+
+                            delay(5)  //  5ms for better balance
                         }
                     }
                 }
@@ -380,12 +379,26 @@ class SyncManager(
      * Checks if the sync session is complete (both send and receive)
      */
     fun checkSyncCompletion(): Boolean {
-        val session = currentSyncSession ?: return false
+        val session = currentSyncSession
+        if (session == null) {
+            Log.d("SyncManager", "Sync completion check: No active session")
+            return false
+        }
+        
         val sendComplete = session.filesSentSuccessfully >= session.totalFilesToSend
         val receiveComplete = session.filesReceivedSuccessfully >= session.totalFilesToReceive
         val isComplete = sendComplete && receiveComplete
         
-        Log.d("SyncManager", "Sync completion check: send=$sendComplete (${ session.filesSentSuccessfully}/${session.totalFilesToSend}), receive=$receiveComplete (${session.filesReceivedSuccessfully}/${session.totalFilesToReceive}), complete=$isComplete")
+        Log.d("SyncManager", "Sync completion check for '${session.folderName}': " +
+            "send=$sendComplete (${session.filesSentSuccessfully}/${session.totalFilesToSend}), " +
+            "receive=$receiveComplete (${session.filesReceivedSuccessfully}/${session.totalFilesToReceive}), " +
+            "complete=$isComplete, initiator=${session.isInitiator}")
+        
+        // Additional safety check: ensure we're not completing with zero expected transfers
+        // unless this was intentionally a zero-file sync
+        if (isComplete && session.totalFilesToSend == 0 && session.totalFilesToReceive == 0) {
+            Log.d("SyncManager", "Sync completion: Zero-file sync detected - this is valid")
+        }
         
         return isComplete
     }
@@ -663,20 +676,6 @@ class SyncManager(
         }
     }
 
-    /**
-     * Processes conflict resolutions after all conflicts are resolved
-     */
-    fun processConflictResolutions(
-        onSendFilesRequest: (List<String>) -> Unit,
-        onSendFiles: (List<String>) -> Unit,
-        onSyncComplete: () -> Unit,
-        onStatusUpdate: (String) -> Unit
-    ) {
-        // This method would contain the logic to process all resolved conflicts
-        // For now, just call onSyncComplete as conflicts have been resolved
-        onSyncComplete()
-    }
-    
     /**
      * Processes resolved conflicts and continues sync
      */

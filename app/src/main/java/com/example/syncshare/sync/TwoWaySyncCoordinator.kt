@@ -115,8 +115,10 @@ class TwoWaySyncCoordinator(
         // Update sync session with expected incoming files
         val currentSession = syncManager.getCurrentSyncSession()
         if (currentSession == null) {
+            Log.d("TwoWaySyncCoordinator", "Creating new sync session for peer file request (0 to send, ${requestedPaths.size} to receive)")
             syncManager.startSyncSession(baseFolderName ?: "", 0, requestedPaths.size, isInitiator = false)
         } else {
+            Log.d("TwoWaySyncCoordinator", "Adding ${requestedPaths.size} expected incoming files to existing session")
             syncManager.addExpectedIncomingFiles(requestedPaths)
         }
         
@@ -136,8 +138,15 @@ class TwoWaySyncCoordinator(
             syncManager.updateSyncSessionProgress(folderName)
         }
         
-        if (progressUpdated && syncManager.checkSyncCompletion()) {
-            completeTwoWaySync(folderName)
+        // Only trigger completion if progress was actually updated AND sync is truly complete
+        if (progressUpdated) {
+            val isComplete = syncManager.checkSyncCompletion()
+            Log.d("TwoWaySyncCoordinator", "Progress updated, sync complete: $isComplete")
+            if (isComplete) {
+                completeTwoWaySync(folderName)
+            }
+        } else {
+            Log.d("TwoWaySyncCoordinator", "Progress not updated - session may not exist or folder name mismatch")
         }
     }
     
@@ -165,10 +174,14 @@ class TwoWaySyncCoordinator(
         if (filesToSend.isNotEmpty()) {
             Log.d("TwoWaySyncCoordinator", "${if (isReceiver) "RECEIVER" else "INITIATOR"}: Sending ${filesToSend.size} files")
             
-            // Initialize sync session if needed
+            // Only initialize sync session if one doesn't exist
+            // This prevents overriding properly initialized sessions with incomplete data
             val currentSession = syncManager.getCurrentSyncSession()
             if (currentSession == null) {
+                Log.d("TwoWaySyncCoordinator", "Initializing new sync session for send operation")
                 syncManager.startSyncSession(folderName, filesToSend.size, 0, isInitiator = !isReceiver)
+            } else {
+                Log.d("TwoWaySyncCoordinator", "Using existing sync session (send=${currentSession.totalFilesToSend}, receive=${currentSession.totalFilesToReceive})")
             }
             
             eventListener?.onStatusUpdate("Sending ${filesToSend.size} files to peer...")
@@ -226,12 +239,11 @@ class TwoWaySyncCoordinator(
                 onComplete = {
                     handleFileTransferComplete(folderName, isIncoming = false)
                     
-                    // Check if sync is complete, otherwise continue with next file
-                    if (!syncManager.checkSyncCompletion()) {
-                        scope.launch {
-                            kotlinx.coroutines.delay(100) // Small delay between files
-                            sendFilesSequentially(localFolderUri, filesToSend, folderName, index + 1)
-                        }
+                    // Continue with next file regardless of completion check
+                    // The sync coordinator will handle final completion when all files are done
+                    scope.launch {
+                        kotlinx.coroutines.delay(100) // Small delay between files
+                        sendFilesSequentially(localFolderUri, filesToSend, folderName, index + 1)
                     }
                 },
                 onError = { error ->

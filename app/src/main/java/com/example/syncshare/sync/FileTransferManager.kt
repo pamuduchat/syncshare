@@ -156,7 +156,7 @@ class FileTransferManager(
                 currentFileOutputStream?.write(truncatedChunk)
                 state.bytesReceived += truncatedChunk.size
                 
-                // Log completion when we reach the expected size
+                // Log completion when expected size is reached
                 if (state.bytesReceived == state.totalSize) {
                     Log.i("FileTransferManager", "File ${state.relativePath} reached expected size (${state.totalSize} bytes) with this truncated chunk")
                 }
@@ -438,7 +438,7 @@ class FileTransferManager(
             return
         }
         
-        // Check if we have a valid receiving state
+        // Check if there is a valid receiving state
         if (currentState == null) {
             Log.w("FileTransferManager", "Ignoring chunk - no active receiving file")
             return

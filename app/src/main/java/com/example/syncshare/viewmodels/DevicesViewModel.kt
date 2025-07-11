@@ -97,16 +97,10 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
     // --- Expose a function to resolve a conflict ---
     fun resolveFileConflict(conflict: SyncManager.FileConflict, option: SyncManager.ConflictResolutionOption) {
+        Log.d("DevicesViewModel", "Resolving conflict for ${conflict.relativePath}: $option")
+        
+        // Delegate to SyncManager which handles the resolution and automatic sync continuation
         syncManager.resolveConflict(conflict, option)
-        
-        Log.d("DevicesViewModel", "Conflict resolved for ${conflict.relativePath}: $option")
-        
-        // If all conflicts resolved, proceed with sync
-        if (fileConflicts.value.isEmpty()) {
-            // For now, just log that conflicts are resolved
-            // The actual sync resumption logic will be handled by the SyncManager
-            Log.d("DevicesViewModel", "All conflicts resolved, sync will continue")
-        }
     }
     
     // --- Sync Operations ---
@@ -173,11 +167,11 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 // Add fallback for SYNC_COMPLETE messages that might not be received properly
                 if (message.type == MessageType.SYNC_COMPLETE) {
                     Log.d("DevicesViewModel", "Sent SYNC_COMPLETE message for ${message.folderName}")
-                    // Give a short delay to allow for message processing, then ensure state is reset
+                    // Give much more time to allow for message processing - only as a safety net
                     viewModelScope.launch {
-                        kotlinx.coroutines.delay(500) // Brief delay for message to be sent
+                        kotlinx.coroutines.delay(5000) // Increased delay to 5 seconds to avoid interfering
                         if (_isRefreshing.value) {
-                            Log.d("DevicesViewModel", "Ensuring sync state is reset after SYNC_COMPLETE sent")
+                            Log.d("DevicesViewModel", "Safety net: ensuring sync state is reset after SYNC_COMPLETE sent")
                             resetSyncState()
                         }
                     }
@@ -660,9 +654,6 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                                 MessageType.FILE_RECEIVED_ACK, 
                                 fileTransferInfo = message.fileTransferInfo
                             ))
-                            
-                            // Add fallback completion check to ensure sync doesn't get stuck
-                            checkAndForceSyncCompletion(folderName)
                         }
                     )
                 }
@@ -670,16 +661,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
                 MessageType.FILE_RECEIVED_ACK -> {
                     Log.i("DevicesViewModel", "Peer ACKed file: ${message.fileTransferInfo?.relativePath}")
                     
-                    // Additional safety net: if we receive an ACK and the sync seems stuck, 
-                    // try to force completion after a brief delay
-                    val folderName = message.folderName ?: message.fileTransferInfo?.let { 
-                        // Try to extract folder name from the message context
-                        _activeSyncDestinationUris.value.entries.firstOrNull()?.key 
-                    } ?: ""
-                    
-                    if (folderName.isNotEmpty()) {
-                        checkAndForceSyncCompletion(folderName)
-                    }
+                    // FILE_RECEIVED_ACK is just confirmation - let normal completion flow handle sync end
                 }
                 
                 MessageType.SYNC_COMPLETE -> {
@@ -851,32 +833,47 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
-     * Fallback method to ensure sync completes even if session tracking fails
+     * Conservative fallback method to ensure sync completes only when truly stuck
+     * This should only be called in exceptional circumstances
      */
     private fun checkAndForceSyncCompletion(folderName: String) {
-        // Check if we have been in a sync state for too long without proper completion
-        // This is a fallback to prevent the UI from getting stuck
+        // Only use this fallback in very specific circumstances
         val isActive = syncManager.isActive.value
-        if (isActive) {
-            Log.d("DevicesViewModel", "Checking for forced sync completion for folder: $folderName")
+        val isRefreshing = _isRefreshing.value
+        
+        if (isActive && isRefreshing) {
+            Log.d("DevicesViewModel", "Scheduling conservative sync completion check for folder: $folderName")
             
-            // Give the normal completion logic a moment to work
+            // Give the normal completion logic much more time to work (increased to 10 seconds)
             viewModelScope.launch {
-                kotlinx.coroutines.delay(1000) // Wait 1 second
+                kotlinx.coroutines.delay(10000) // Wait 10 seconds to allow normal completion
                 
-                // If still active after delay, force completion
-                if (syncManager.isActive.value) {
-                    Log.w("DevicesViewModel", "Forcing sync completion for folder: $folderName - sync session may be stuck")
+                // Only force completion if ALL conditions indicate the sync is truly stuck
+                val stillActive = syncManager.isActive.value
+                val stillRefreshing = _isRefreshing.value
+                val currentSession = syncManager.getCurrentSyncSession()
+                
+                if (stillActive && stillRefreshing && currentSession != null) {
+                    // Check if we're making progress or if we're truly stuck
+                    val sendComplete = currentSession.filesSentSuccessfully >= currentSession.totalFilesToSend
+                    val receiveComplete = currentSession.filesReceivedSuccessfully >= currentSession.totalFilesToReceive
+                    val shouldBeComplete = sendComplete && receiveComplete
                     
-                    // Send completion message and reset state
-                    sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = folderName))
-                    resetSyncState()
-                    permissionRequestStatus.value = "Sync completed for '$folderName' (auto-recovered)."
-                    syncHistoryManager.addEntry(SyncHistoryEntry(
-                        folderName = folderName, 
-                        status = "Completed", 
-                        details = "Sync completed with fallback completion logic - session tracking may have failed."
-                    ))
+                    if (shouldBeComplete) {
+                        Log.w("DevicesViewModel", "Sync appears complete but UI stuck - forcing completion for folder: $folderName")
+                        sendMessage(SyncMessage(MessageType.SYNC_COMPLETE, folderName = folderName))
+                        resetSyncState()
+                        permissionRequestStatus.value = "Sync completed for '$folderName' (recovered from stuck state)."
+                        syncHistoryManager.addEntry(SyncHistoryEntry(
+                            folderName = folderName, 
+                            status = "Completed", 
+                            details = "Sync completed with conservative fallback - UI was stuck despite completion."
+                        ))
+                    } else {
+                        Log.d("DevicesViewModel", "Sync still in progress for folder: $folderName - not forcing completion")
+                    }
+                } else {
+                    Log.d("DevicesViewModel", "Normal sync completion detected for folder: $folderName, cancelling fallback")
                 }
             }
         }

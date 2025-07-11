@@ -50,7 +50,6 @@ class WifiDirectBroadcastReceiver(
                         override fun onPeersAvailable(peerList: WifiP2pDeviceList?) {
                             Log.i("WifiDirectReceiver", "PeerListListener.onPeersAvailable | System peer list size: ${peerList?.deviceList?.size ?: "null"}")
                             if (peerList != null) {
-                                // Corrected call to the renamed method in WifiDirectManager
                                 wifiDirectManager.onP2pPeersAvailable(peerList.deviceList ?: emptyList())
                             } else {
                                 Log.w("WifiDirectReceiver", "PeerListListener.onPeersAvailable received NULL peerList object.")
